@@ -96,6 +96,25 @@ Services:
 - API: `http://localhost:8088`
 - SQL Server: `localhost:14333`
 
+## Architecture (amd64 + arm64)
+
+- The API Docker image now builds for the target platform (`amd64` or `arm64`) automatically.
+- To publish a multi-arch API image:
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t yourrepo/courtview-api:latest \
+  --push .
+```
+
+- If you are on Apple Silicon and need SQL Server container compatibility, you can run compose under amd64 emulation:
+
+```bash
+export DOCKER_DEFAULT_PLATFORM=linux/amd64
+docker compose up --build -d
+```
+
 ## Environment variables
 
 Core:

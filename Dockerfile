@@ -1,7 +1,10 @@
 # syntax=docker/dockerfile:1.7
 
-FROM golang:1.23-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS build
 WORKDIR /src
+
+ARG TARGETOS
+ARG TARGETARCH
 
 RUN apk add --no-cache ca-certificates git
 
@@ -11,7 +14,7 @@ RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/courtview-api ./cmd/courtview-api
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -o /out/courtview-api ./cmd/courtview-api
 
 FROM alpine:3.20
 RUN addgroup -S app && adduser -S app -G app \
