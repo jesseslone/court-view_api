@@ -455,8 +455,13 @@ FROM sys.database_files
 		if strings.EqualFold(f.typeDesc, "LOG") {
 			maxSize = max(1, logMaxSizeMB/max(1, logFileCount))
 		}
-		stmt := fmt.Sprintf(`ALTER DATABASE [%s] MODIFY FILE (NAME = N'%s', MAXSIZE = %dMB);`, dbNameEscaped, fileNameEscaped, maxSize)
-		if _, err := appDB.ExecContext(ctx, stmt); err != nil {
+		growthSize := max(1, maxSize/5)
+		stmtGrowth := fmt.Sprintf(`ALTER DATABASE [%s] MODIFY FILE (NAME = N'%s', FILEGROWTH = %dMB);`, dbNameEscaped, fileNameEscaped, growthSize)
+		if _, err := appDB.ExecContext(ctx, stmtGrowth); err != nil {
+			return fmt.Errorf("set growth for db file %q: %w", f.name, err)
+		}
+		stmtMax := fmt.Sprintf(`ALTER DATABASE [%s] MODIFY FILE (NAME = N'%s', MAXSIZE = %dMB);`, dbNameEscaped, fileNameEscaped, maxSize)
+		if _, err := appDB.ExecContext(ctx, stmtMax); err != nil {
 			return fmt.Errorf("set max size for db file %q: %w", f.name, err)
 		}
 	}
