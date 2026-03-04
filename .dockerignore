@@ -1,0 +1,16 @@
+.git
+.gitignore
+README.md
+planning.md
+setup.py
+tests/
+courtview_lookup/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.swp
+*.swo
+.env
+.env.*
+.DS_Store
