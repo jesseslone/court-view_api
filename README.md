@@ -33,6 +33,7 @@ Production-oriented API for Alaska CourtView with:
   - defaults: `count=100`, `year=current year`, `start_seq=1`, `max_attempts=5000`
   - optional:
     - `timeout_seconds` (default `900`)
+    - `concurrency` (default `1`, max `24`)
     - `include_defendant_network` (default `false`)
     - `max_related_parties` (default `10`)
     - `max_related_cases` (default `100`)
@@ -45,12 +46,24 @@ Example backfill call:
 curl -X POST "http://localhost:8088/v1/admin/backfill/anchorage-criminal?count=100"
 ```
 
+Concurrent backfill example:
+
+```bash
+curl -X POST "http://localhost:8088/v1/admin/backfill/anchorage-criminal?count=100&concurrency=6"
+```
+
 Backfill response includes pull metrics:
 
 - total duration
 - attempts/sec and cases/sec
 - stage timing stats (`attempt`, `search`, optional `expand`, `persist`) with min/avg/p50/p90/p95/max
 - error counts and sample errors
+
+## Party data
+
+- `case_parties` stores extracted parties for each case (for example `Defendant`, `Prosecution`).
+- Prosecution rows can be entities like `State of Alaska` or `Municipality of Anchorage`.
+- Defendant expansion/backfill targeting now filters to likely person defendants and excludes government/entity names.
 
 ## Case-number normalization
 
@@ -80,6 +93,18 @@ On writes, the service:
 go mod tidy
 go test ./...
 go run ./cmd/courtview-api
+```
+
+Outside-container benchmark example:
+
+```bash
+# terminal 1: run API on host using local SQL Server container
+DB_ENABLED=true DB_HOST=localhost DB_PORT=14333 DB_USER=sa DB_PASSWORD='YourStrongPassword!123' \
+go run ./cmd/courtview-api
+
+# terminal 2: compare sequential vs concurrent
+curl -s -X POST "http://localhost:8088/v1/admin/backfill/anchorage-criminal?count=50&concurrency=1" | jq '.metrics'
+curl -s -X POST "http://localhost:8088/v1/admin/backfill/anchorage-criminal?count=50&concurrency=6" | jq '.metrics'
 ```
 
 ## Docker Compose (API + SQL Server)

@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"courtview_lookup/internal/courtview"
@@ -26,6 +27,7 @@ type backfillRequest struct {
 	StartSequence           int  `json:"start_sequence"`
 	MaxAttempts             int  `json:"max_attempts"`
 	TimeoutSeconds          int  `json:"timeout_seconds"`
+	Concurrency             int  `json:"concurrency"`
 	IncludeDefendantNetwork bool `json:"include_defendant_network"`
 	MaxRelatedParties       int  `json:"max_related_parties"`
 	MaxRelatedCases         int  `json:"max_related_cases"`
@@ -57,6 +59,7 @@ type durationStats struct {
 }
 
 type backfillMetrics struct {
+	Concurrency      int           `json:"concurrency"`
 	StartedAt        string        `json:"started_at"`
 	FinishedAt       string        `json:"finished_at"`
 	TotalDurationMS  float64       `json:"total_duration_ms"`
@@ -74,6 +77,23 @@ type backfillResponse struct {
 	Request backfillRequest `json:"request"`
 	Summary backfillSummary `json:"summary"`
 	Metrics backfillMetrics `json:"metrics"`
+}
+
+type backfillAttemptResult struct {
+	sequence          int
+	requestCaseNumber string
+	foundCaseNumbers  []string
+	attemptMS         float64
+	searchMS          float64
+	expandMS          float64
+	persistMS         float64
+	hasExpandTiming   bool
+	hasPersistTiming  bool
+	searchErr         error
+	expandErr         error
+	persistErr        error
+	persisted         int
+	changed           int
 }
 
 func NewServer(client *courtview.Client, store *sqlserver.Store) *Server {
@@ -251,11 +271,13 @@ func (s *Server) handleBackfillAnchorageCriminal(w http.ResponseWriter, r *http.
 	}
 
 	startedAt := time.Now().UTC()
-	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(req.TimeoutSeconds)*time.Second)
-	defer cancel()
+	timeoutCtx, timeoutCancel := context.WithTimeout(r.Context(), time.Duration(req.TimeoutSeconds)*time.Second)
+	defer timeoutCancel()
+	runCtx, runCancel := context.WithCancel(timeoutCtx)
+	defer runCancel()
 
-	caseNumberSet := make(map[string]struct{})
-	caseNumbers := make([]string, 0, req.Count)
+	caseNumberSet := make(map[string]struct{}, req.Count*2)
+	caseNumbers := make([]string, 0, req.Count*2)
 	searchErrors := 0
 	expandErrors := 0
 	persistErrors := 0
@@ -263,110 +285,101 @@ func (s *Server) handleBackfillAnchorageCriminal(w http.ResponseWriter, r *http.
 	changedCases := 0
 	unchangedCases := 0
 	errorSample := make([]string, 0, 10)
-	lastSequence := req.StartSequence - 1
+	lastSequence := 0
 
 	attemptSamples := make([]float64, 0, req.MaxAttempts)
 	searchSamples := make([]float64, 0, req.MaxAttempts)
 	expandSamples := make([]float64, 0, req.MaxAttempts)
 	persistSamples := make([]float64, 0, req.MaxAttempts)
-	partialOnTimeout := false
 
-	for i := 0; i < req.MaxAttempts && len(caseNumbers) < req.Count; i++ {
-		if ctx.Err() != nil {
-			partialOnTimeout = true
-			break
+	jobs := make(chan int, req.MaxAttempts)
+	for i := 0; i < req.MaxAttempts; i++ {
+		jobs <- req.StartSequence + i
+	}
+	close(jobs)
+
+	results := make(chan backfillAttemptResult, req.Concurrency*2)
+	var wg sync.WaitGroup
+	for worker := 0; worker < req.Concurrency; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			workerClient := s.client
+			if req.Concurrency > 1 {
+				newClient, err := courtview.NewClient(s.client.BaseURL())
+				if err == nil {
+					workerClient = newClient
+				}
+			}
+
+			for seq := range jobs {
+				if runCtx.Err() != nil {
+					return
+				}
+				result := s.runBackfillAttempt(runCtx, workerClient, req, seq)
+				select {
+				case results <- result:
+				case <-runCtx.Done():
+					return
+				}
+			}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	for result := range results {
+		if result.sequence > lastSequence {
+			lastSequence = result.sequence
+		}
+		attemptSamples = append(attemptSamples, result.attemptMS)
+		searchSamples = append(searchSamples, result.searchMS)
+		if result.hasExpandTiming {
+			expandSamples = append(expandSamples, result.expandMS)
+		}
+		if result.hasPersistTiming {
+			persistSamples = append(persistSamples, result.persistMS)
 		}
 
-		seq := req.StartSequence + i
-		lastSequence = seq
-		caseNumber := formatAnchorageCriminalCaseNumber(req.YearTwoDigits, seq)
-		attemptStart := time.Now()
-
-		searchStart := time.Now()
-		resp, err := s.client.SearchByCaseNumber(ctx, caseNumber, true, 50, true, 20)
-		searchSamples = append(searchSamples, time.Since(searchStart).Seconds()*1000)
-		if err != nil {
+		if result.searchErr != nil {
 			searchErrors++
 			if len(errorSample) < cap(errorSample) {
-				errorSample = append(errorSample, fmt.Sprintf("%s search: %v", caseNumber, err))
-			}
-			attemptSamples = append(attemptSamples, time.Since(attemptStart).Seconds()*1000)
-			continue
-		}
-
-		if req.IncludeDefendantNetwork {
-			expandStart := time.Now()
-			relatedCases, _, expandErr := s.expandDefendantNetwork(
-				ctx,
-				resp.Results.Rows,
-				req.MaxRelatedParties,
-				req.MaxRelatedCases,
-				true,
-				20,
-			)
-			expandSamples = append(expandSamples, time.Since(expandStart).Seconds()*1000)
-			if expandErr != nil {
-				expandErrors++
-				if len(errorSample) < cap(errorSample) {
-					errorSample = append(errorSample, fmt.Sprintf("%s expand: %v", caseNumber, expandErr))
-				}
-			} else {
-				resp.Cases = dedupeCases(append(resp.Cases, relatedCases...))
+				errorSample = append(errorSample, fmt.Sprintf("%s search: %v", result.requestCaseNumber, result.searchErr))
 			}
 		}
-
-		for _, row := range resp.Results.Rows {
-			cn := strings.ToUpper(strings.TrimSpace(row.CaseNumber))
-			if cn == "" {
-				continue
+		if result.expandErr != nil {
+			expandErrors++
+			if len(errorSample) < cap(errorSample) {
+				errorSample = append(errorSample, fmt.Sprintf("%s expand: %v", result.requestCaseNumber, result.expandErr))
 			}
-			if !strings.HasPrefix(cn, fmt.Sprintf("3AN-%02d-", req.YearTwoDigits)) {
-				continue
-			}
-			if !strings.HasSuffix(cn, "CR") {
-				continue
-			}
-			if _, exists := caseNumberSet[cn]; exists {
-				continue
-			}
-			caseNumberSet[cn] = struct{}{}
-			caseNumbers = append(caseNumbers, cn)
 		}
-		for _, c := range resp.Cases {
-			cn := strings.ToUpper(strings.TrimSpace(c.CaseNumber))
-			if cn == "" {
-				continue
-			}
-			if !strings.HasPrefix(cn, fmt.Sprintf("3AN-%02d-", req.YearTwoDigits)) {
-				continue
-			}
-			if !strings.HasSuffix(cn, "CR") {
-				continue
-			}
-			if _, exists := caseNumberSet[cn]; exists {
-				continue
-			}
-			caseNumberSet[cn] = struct{}{}
-			caseNumbers = append(caseNumbers, cn)
-		}
-
-		persistStart := time.Now()
-		persisted, changed, persistErr := s.persistCaseSearchResponseWithStats(ctx, resp)
-		persistSamples = append(persistSamples, time.Since(persistStart).Seconds()*1000)
-		if persistErr != nil {
+		if result.persistErr != nil {
 			persistErrors++
 			if len(errorSample) < cap(errorSample) {
-				errorSample = append(errorSample, fmt.Sprintf("%s persist: %v", caseNumber, persistErr))
+				errorSample = append(errorSample, fmt.Sprintf("%s persist: %v", result.requestCaseNumber, result.persistErr))
 			}
-		} else {
-			persistedCases += persisted
-			changedCases += changed
-			unchangedCases += (persisted - changed)
+		}
+		persistedCases += result.persisted
+		changedCases += result.changed
+		unchangedCases += (result.persisted - result.changed)
+
+		for _, cn := range result.foundCaseNumbers {
+			if _, exists := caseNumberSet[cn]; exists {
+				continue
+			}
+			caseNumberSet[cn] = struct{}{}
+			caseNumbers = append(caseNumbers, cn)
 		}
 
-		attemptSamples = append(attemptSamples, time.Since(attemptStart).Seconds()*1000)
+		if len(caseNumbers) >= req.Count {
+			runCancel()
+		}
 	}
 
+	sort.Strings(caseNumbers)
 	if len(caseNumbers) > req.Count {
 		caseNumbers = caseNumbers[:req.Count]
 	}
@@ -396,6 +409,7 @@ func (s *Server) handleBackfillAnchorageCriminal(w http.ResponseWriter, r *http.
 			UniqueCaseNumbersCaptured: caseNumbers,
 		},
 		Metrics: backfillMetrics{
+			Concurrency:      req.Concurrency,
 			StartedAt:        startedAt.Format(time.RFC3339),
 			FinishedAt:       finishedAt.Format(time.RFC3339),
 			TotalDurationMS:  totalDurationMS,
@@ -406,7 +420,7 @@ func (s *Server) handleBackfillAnchorageCriminal(w http.ResponseWriter, r *http.
 			ExpandDuration:   calculateDurationStats(expandSamples),
 			PersistDuration:  calculateDurationStats(persistSamples),
 			ErrorSample:      errorSample,
-			PartialOnTimeout: partialOnTimeout,
+			PartialOnTimeout: foundCases < req.Count && errors.Is(timeoutCtx.Err(), context.DeadlineExceeded),
 		},
 	}
 
@@ -417,8 +431,117 @@ func (s *Server) handleBackfillAnchorageCriminal(w http.ResponseWriter, r *http.
 	writeJSON(w, status, resp)
 }
 
+func (s *Server) runBackfillAttempt(
+	ctx context.Context,
+	client *courtview.Client,
+	req backfillRequest,
+	seq int,
+) backfillAttemptResult {
+	requestCaseNumber := formatAnchorageCriminalCaseNumber(req.YearTwoDigits, seq)
+	result := backfillAttemptResult{
+		sequence:          seq,
+		requestCaseNumber: requestCaseNumber,
+	}
+
+	attemptStart := time.Now()
+	searchStart := time.Now()
+	resp, err := client.SearchByCaseNumber(ctx, requestCaseNumber, true, 50, true, 20)
+	result.searchMS = time.Since(searchStart).Seconds() * 1000
+	if err != nil {
+		result.searchErr = err
+		result.attemptMS = time.Since(attemptStart).Seconds() * 1000
+		return result
+	}
+
+	if req.IncludeDefendantNetwork {
+		expandStart := time.Now()
+		relatedCases, _, expandErr := s.expandDefendantNetworkWithClient(
+			ctx,
+			client,
+			resp.Results.Rows,
+			req.MaxRelatedParties,
+			req.MaxRelatedCases,
+			true,
+			20,
+		)
+		result.expandMS = time.Since(expandStart).Seconds() * 1000
+		result.hasExpandTiming = true
+		if expandErr != nil {
+			result.expandErr = expandErr
+		} else {
+			resp.Cases = dedupeCases(append(resp.Cases, relatedCases...))
+		}
+	}
+
+	result.foundCaseNumbers = extractTargetAnchorageCrCaseNumbers(resp, req.YearTwoDigits)
+
+	persistStart := time.Now()
+	persisted, changed, persistErr := s.persistCaseSearchResponseWithStats(ctx, resp)
+	result.persistMS = time.Since(persistStart).Seconds() * 1000
+	result.hasPersistTiming = true
+	result.persisted = persisted
+	result.changed = changed
+	result.persistErr = persistErr
+	result.attemptMS = time.Since(attemptStart).Seconds() * 1000
+	return result
+}
+
+func extractTargetAnchorageCrCaseNumbers(resp courtview.CaseSearchResponse, yearTwoDigits int) []string {
+	seen := make(map[string]struct{})
+	out := make([]string, 0)
+
+	add := func(caseNumber string) {
+		cn := strings.ToUpper(strings.TrimSpace(caseNumber))
+		if !isTargetAnchorageCrCaseNumber(cn, yearTwoDigits) {
+			return
+		}
+		if _, exists := seen[cn]; exists {
+			return
+		}
+		seen[cn] = struct{}{}
+		out = append(out, cn)
+	}
+
+	for _, row := range resp.Results.Rows {
+		add(row.CaseNumber)
+	}
+	for _, c := range resp.Cases {
+		add(c.CaseNumber)
+	}
+
+	filtered := make([]string, 0, len(out))
+	for _, cn := range out {
+		rows := rowsForCase(resp.Results.Rows, cn)
+		if len(courtview.ExtractDefendantParties(rows)) == 0 {
+			continue
+		}
+		filtered = append(filtered, cn)
+	}
+	return filtered
+}
+
+func isTargetAnchorageCrCaseNumber(caseNumber string, yearTwoDigits int) bool {
+	if caseNumber == "" {
+		return false
+	}
+	return strings.HasPrefix(caseNumber, fmt.Sprintf("3AN-%02d-", yearTwoDigits)) &&
+		strings.HasSuffix(caseNumber, "CR")
+}
+
 func (s *Server) expandDefendantNetwork(
 	ctx context.Context,
+	rows []courtview.SearchResultRow,
+	maxRelatedParties int,
+	maxRelatedCases int,
+	allPages bool,
+	maxPages int,
+) ([]courtview.CaseDetails, []courtview.PartyRecord, error) {
+	return s.expandDefendantNetworkWithClient(ctx, s.client, rows, maxRelatedParties, maxRelatedCases, allPages, maxPages)
+}
+
+func (s *Server) expandDefendantNetworkWithClient(
+	ctx context.Context,
+	client *courtview.Client,
 	rows []courtview.SearchResultRow,
 	maxRelatedParties int,
 	maxRelatedCases int,
@@ -443,7 +566,7 @@ func (s *Server) expandDefendantNetwork(
 		}
 		seenNames[nameKey] = struct{}{}
 
-		nameResp, err := s.client.SearchByName(ctx, courtview.NameSearchRequest{
+		nameResp, err := client.SearchByName(ctx, courtview.NameSearchRequest{
 			FirstName: party.FirstName,
 			LastName:  party.LastName,
 			DOBFrom:   party.DOB,
@@ -630,6 +753,7 @@ func parseBackfillOptions(w http.ResponseWriter, r *http.Request) (backfillReque
 		StartSequence:           1,
 		MaxAttempts:             5000,
 		TimeoutSeconds:          900,
+		Concurrency:             1,
 		IncludeDefendantNetwork: false,
 		MaxRelatedParties:       10,
 		MaxRelatedCases:         100,
@@ -686,6 +810,15 @@ func parseBackfillOptions(w http.ResponseWriter, r *http.Request) (backfillReque
 			return backfillRequest{}, false
 		}
 		req.TimeoutSeconds = n
+	}
+
+	if raw := strings.TrimSpace(r.URL.Query().Get("concurrency")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > 24 {
+			writeError(w, http.StatusBadRequest, "concurrency must be an integer between 1 and 24")
+			return backfillRequest{}, false
+		}
+		req.Concurrency = n
 	}
 
 	if raw := strings.TrimSpace(r.URL.Query().Get("include_defendant_network")); raw != "" {

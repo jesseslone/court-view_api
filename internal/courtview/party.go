@@ -2,6 +2,7 @@ package courtview
 
 import (
 	"strings"
+	"unicode"
 )
 
 type PartyRecord struct {
@@ -65,11 +66,69 @@ func ExtractDefendantParties(rows []SearchResultRow) []PartyRecord {
 	defendants := make([]PartyRecord, 0)
 	for _, party := range all {
 		role := strings.ToLower(strings.TrimSpace(party.Role))
-		if strings.Contains(role, "defendant") {
-			defendants = append(defendants, party)
+		if !strings.Contains(role, "defendant") {
+			continue
 		}
+		if !IsLikelyPersonName(party.FullName) {
+			continue
+		}
+		defendants = append(defendants, party)
 	}
 	return defendants
+}
+
+func IsLikelyGovernmentEntity(name string) bool {
+	n := strings.ToLower(cleanText(name))
+	if n == "" {
+		return false
+	}
+
+	keywords := []string{
+		"state of ",
+		"municipality of ",
+		"city of ",
+		"borough of ",
+		"county of ",
+		"department of ",
+		"police department",
+		"district attorney",
+		"office of ",
+		"united states",
+	}
+	for _, keyword := range keywords {
+		if strings.Contains(n, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
+func IsLikelyPersonName(fullName string) bool {
+	n := cleanText(fullName)
+	if n == "" {
+		return false
+	}
+	if IsLikelyGovernmentEntity(n) {
+		return false
+	}
+	for _, r := range n {
+		if unicode.IsDigit(r) {
+			return false
+		}
+	}
+
+	if strings.Contains(n, ",") {
+		parts := strings.SplitN(n, ",", 2)
+		last := strings.TrimSpace(parts[0])
+		first := strings.TrimSpace(parts[1])
+		return last != "" && first != ""
+	}
+
+	fields := strings.Fields(n)
+	if len(fields) < 2 || len(fields) > 5 {
+		return false
+	}
+	return true
 }
 
 func splitPartyName(fullName string) (firstName, lastName string) {

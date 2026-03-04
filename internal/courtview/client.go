@@ -24,6 +24,13 @@ type Client struct {
 	userAgent  string
 }
 
+func (c *Client) BaseURL() string {
+	if c == nil {
+		return defaultBaseURL
+	}
+	return c.baseURL
+}
+
 func NewClient(baseURL string) (*Client, error) {
 	if strings.TrimSpace(baseURL) == "" {
 		baseURL = defaultBaseURL
