@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
 )
@@ -31,10 +32,18 @@ func NewClient(baseURL string) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create cookie jar: %w", err)
 	}
+	transport := &http.Transport{
+		Proxy:              http.ProxyFromEnvironment,
+		ForceAttemptHTTP2:  false,
+		DisableCompression: true,
+		DisableKeepAlives:  true,
+	}
 	return &Client{
 		baseURL: strings.TrimSpace(baseURL),
 		httpClient: &http.Client{
-			Jar: jar,
+			Jar:       jar,
+			Transport: transport,
+			Timeout:   60 * time.Second,
 		},
 		userAgent: "courtview-lookup-go/0.1",
 	}, nil
@@ -460,6 +469,7 @@ func (c *Client) get(ctx context.Context, rawURL string, headers map[string]stri
 		return nil, "", nil, err
 	}
 	req.Header.Set("User-Agent", c.userAgent)
+	req.Header.Set("Connection", "close")
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -487,6 +497,7 @@ func (c *Client) postForm(ctx context.Context, rawURL string, values url.Values,
 	}
 	req.Header.Set("User-Agent", c.userAgent)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Connection", "close")
 	for k, v := range headers {
 		if strings.TrimSpace(v) != "" {
 			req.Header.Set(k, v)
