@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +20,62 @@ type Server struct {
 	store  *sqlserver.Store
 }
 
+type backfillRequest struct {
+	Count                   int  `json:"count"`
+	YearTwoDigits           int  `json:"year_two_digits"`
+	StartSequence           int  `json:"start_sequence"`
+	MaxAttempts             int  `json:"max_attempts"`
+	TimeoutSeconds          int  `json:"timeout_seconds"`
+	IncludeDefendantNetwork bool `json:"include_defendant_network"`
+	MaxRelatedParties       int  `json:"max_related_parties"`
+	MaxRelatedCases         int  `json:"max_related_cases"`
+}
+
+type backfillSummary struct {
+	Complete                  bool     `json:"complete"`
+	TargetCases               int      `json:"target_cases"`
+	FoundCases                int      `json:"found_cases"`
+	AttemptedCaseNumbers      int      `json:"attempted_case_numbers"`
+	LastSequenceTried         int      `json:"last_sequence_tried"`
+	SearchErrors              int      `json:"search_errors"`
+	ExpandErrors              int      `json:"expand_errors"`
+	PersistErrors             int      `json:"persist_errors"`
+	PersistedCases            int      `json:"persisted_cases"`
+	PersistedChangedCases     int      `json:"persisted_changed_cases"`
+	PersistedUnchangedCases   int      `json:"persisted_unchanged_cases"`
+	UniqueCaseNumbersCaptured []string `json:"unique_case_numbers_captured"`
+}
+
+type durationStats struct {
+	Count int     `json:"count"`
+	MinMS float64 `json:"min_ms"`
+	AvgMS float64 `json:"avg_ms"`
+	P50MS float64 `json:"p50_ms"`
+	P90MS float64 `json:"p90_ms"`
+	P95MS float64 `json:"p95_ms"`
+	MaxMS float64 `json:"max_ms"`
+}
+
+type backfillMetrics struct {
+	StartedAt        string        `json:"started_at"`
+	FinishedAt       string        `json:"finished_at"`
+	TotalDurationMS  float64       `json:"total_duration_ms"`
+	AttemptsPerSec   float64       `json:"attempts_per_second"`
+	CasesPerSec      float64       `json:"cases_per_second"`
+	AttemptDuration  durationStats `json:"attempt_duration"`
+	SearchDuration   durationStats `json:"search_duration"`
+	ExpandDuration   durationStats `json:"expand_duration"`
+	PersistDuration  durationStats `json:"persist_duration"`
+	ErrorSample      []string      `json:"error_sample,omitempty"`
+	PartialOnTimeout bool          `json:"partial_on_timeout"`
+}
+
+type backfillResponse struct {
+	Request backfillRequest `json:"request"`
+	Summary backfillSummary `json:"summary"`
+	Metrics backfillMetrics `json:"metrics"`
+}
+
 func NewServer(client *courtview.Client, store *sqlserver.Store) *Server {
 	return &Server{client: client, store: store}
 }
@@ -28,6 +85,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/v1/search/name", s.handleNameSearch)
 	mux.HandleFunc("/v1/search/case", s.handleCaseSearch)
+	mux.HandleFunc("/v1/admin/backfill/anchorage-criminal", s.handleBackfillAnchorageCriminal)
 	return mux
 }
 
@@ -177,6 +235,188 @@ func (s *Server) handleCaseSearch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+func (s *Server) handleBackfillAnchorageCriminal(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.store == nil || !s.store.Enabled() {
+		writeError(w, http.StatusServiceUnavailable, "database is not enabled")
+		return
+	}
+
+	req, ok := parseBackfillOptions(w, r)
+	if !ok {
+		return
+	}
+
+	startedAt := time.Now().UTC()
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(req.TimeoutSeconds)*time.Second)
+	defer cancel()
+
+	caseNumberSet := make(map[string]struct{})
+	caseNumbers := make([]string, 0, req.Count)
+	searchErrors := 0
+	expandErrors := 0
+	persistErrors := 0
+	persistedCases := 0
+	changedCases := 0
+	unchangedCases := 0
+	errorSample := make([]string, 0, 10)
+	lastSequence := req.StartSequence - 1
+
+	attemptSamples := make([]float64, 0, req.MaxAttempts)
+	searchSamples := make([]float64, 0, req.MaxAttempts)
+	expandSamples := make([]float64, 0, req.MaxAttempts)
+	persistSamples := make([]float64, 0, req.MaxAttempts)
+	partialOnTimeout := false
+
+	for i := 0; i < req.MaxAttempts && len(caseNumbers) < req.Count; i++ {
+		if ctx.Err() != nil {
+			partialOnTimeout = true
+			break
+		}
+
+		seq := req.StartSequence + i
+		lastSequence = seq
+		caseNumber := formatAnchorageCriminalCaseNumber(req.YearTwoDigits, seq)
+		attemptStart := time.Now()
+
+		searchStart := time.Now()
+		resp, err := s.client.SearchByCaseNumber(ctx, caseNumber, true, 50, true, 20)
+		searchSamples = append(searchSamples, time.Since(searchStart).Seconds()*1000)
+		if err != nil {
+			searchErrors++
+			if len(errorSample) < cap(errorSample) {
+				errorSample = append(errorSample, fmt.Sprintf("%s search: %v", caseNumber, err))
+			}
+			attemptSamples = append(attemptSamples, time.Since(attemptStart).Seconds()*1000)
+			continue
+		}
+
+		if req.IncludeDefendantNetwork {
+			expandStart := time.Now()
+			relatedCases, _, expandErr := s.expandDefendantNetwork(
+				ctx,
+				resp.Results.Rows,
+				req.MaxRelatedParties,
+				req.MaxRelatedCases,
+				true,
+				20,
+			)
+			expandSamples = append(expandSamples, time.Since(expandStart).Seconds()*1000)
+			if expandErr != nil {
+				expandErrors++
+				if len(errorSample) < cap(errorSample) {
+					errorSample = append(errorSample, fmt.Sprintf("%s expand: %v", caseNumber, expandErr))
+				}
+			} else {
+				resp.Cases = dedupeCases(append(resp.Cases, relatedCases...))
+			}
+		}
+
+		for _, row := range resp.Results.Rows {
+			cn := strings.ToUpper(strings.TrimSpace(row.CaseNumber))
+			if cn == "" {
+				continue
+			}
+			if !strings.HasPrefix(cn, fmt.Sprintf("3AN-%02d-", req.YearTwoDigits)) {
+				continue
+			}
+			if !strings.HasSuffix(cn, "CR") {
+				continue
+			}
+			if _, exists := caseNumberSet[cn]; exists {
+				continue
+			}
+			caseNumberSet[cn] = struct{}{}
+			caseNumbers = append(caseNumbers, cn)
+		}
+		for _, c := range resp.Cases {
+			cn := strings.ToUpper(strings.TrimSpace(c.CaseNumber))
+			if cn == "" {
+				continue
+			}
+			if !strings.HasPrefix(cn, fmt.Sprintf("3AN-%02d-", req.YearTwoDigits)) {
+				continue
+			}
+			if !strings.HasSuffix(cn, "CR") {
+				continue
+			}
+			if _, exists := caseNumberSet[cn]; exists {
+				continue
+			}
+			caseNumberSet[cn] = struct{}{}
+			caseNumbers = append(caseNumbers, cn)
+		}
+
+		persistStart := time.Now()
+		persisted, changed, persistErr := s.persistCaseSearchResponseWithStats(ctx, resp)
+		persistSamples = append(persistSamples, time.Since(persistStart).Seconds()*1000)
+		if persistErr != nil {
+			persistErrors++
+			if len(errorSample) < cap(errorSample) {
+				errorSample = append(errorSample, fmt.Sprintf("%s persist: %v", caseNumber, persistErr))
+			}
+		} else {
+			persistedCases += persisted
+			changedCases += changed
+			unchangedCases += (persisted - changed)
+		}
+
+		attemptSamples = append(attemptSamples, time.Since(attemptStart).Seconds()*1000)
+	}
+
+	if len(caseNumbers) > req.Count {
+		caseNumbers = caseNumbers[:req.Count]
+	}
+
+	finishedAt := time.Now().UTC()
+	totalDurationMS := finishedAt.Sub(startedAt).Seconds() * 1000
+	if totalDurationMS < 1 {
+		totalDurationMS = 1
+	}
+	attempts := len(attemptSamples)
+	foundCases := len(caseNumbers)
+
+	resp := backfillResponse{
+		Request: req,
+		Summary: backfillSummary{
+			Complete:                  foundCases >= req.Count,
+			TargetCases:               req.Count,
+			FoundCases:                foundCases,
+			AttemptedCaseNumbers:      attempts,
+			LastSequenceTried:         lastSequence,
+			SearchErrors:              searchErrors,
+			ExpandErrors:              expandErrors,
+			PersistErrors:             persistErrors,
+			PersistedCases:            persistedCases,
+			PersistedChangedCases:     changedCases,
+			PersistedUnchangedCases:   unchangedCases,
+			UniqueCaseNumbersCaptured: caseNumbers,
+		},
+		Metrics: backfillMetrics{
+			StartedAt:        startedAt.Format(time.RFC3339),
+			FinishedAt:       finishedAt.Format(time.RFC3339),
+			TotalDurationMS:  totalDurationMS,
+			AttemptsPerSec:   float64(attempts) / (totalDurationMS / 1000),
+			CasesPerSec:      float64(foundCases) / (totalDurationMS / 1000),
+			AttemptDuration:  calculateDurationStats(attemptSamples),
+			SearchDuration:   calculateDurationStats(searchSamples),
+			ExpandDuration:   calculateDurationStats(expandSamples),
+			PersistDuration:  calculateDurationStats(persistSamples),
+			ErrorSample:      errorSample,
+			PartialOnTimeout: partialOnTimeout,
+		},
+	}
+
+	status := http.StatusOK
+	if !resp.Summary.Complete {
+		status = http.StatusPartialContent
+	}
+	writeJSON(w, status, resp)
+}
+
 func (s *Server) expandDefendantNetwork(
 	ctx context.Context,
 	rows []courtview.SearchResultRow,
@@ -240,19 +480,31 @@ func (s *Server) persistNameSearchResponse(ctx context.Context, resp courtview.N
 }
 
 func (s *Server) persistCaseSearchResponse(ctx context.Context, resp courtview.CaseSearchResponse) error {
+	_, _, err := s.persistCaseSearchResponseWithStats(ctx, resp)
+	return err
+}
+
+func (s *Server) persistCaseSearchResponseWithStats(ctx context.Context, resp courtview.CaseSearchResponse) (int, int, error) {
 	if s.store == nil || !s.store.Enabled() {
-		return nil
+		return 0, 0, nil
 	}
+	persisted := 0
+	changed := 0
 	for _, caseDetails := range resp.Cases {
 		if strings.TrimSpace(caseDetails.CaseNumber) == "" {
 			continue
 		}
 		rows := rowsForCase(resp.Results.Rows, caseDetails.CaseNumber)
-		if _, err := s.store.UpsertCase(ctx, caseDetails, rows); err != nil {
-			return err
+		wasChanged, err := s.store.UpsertCase(ctx, caseDetails, rows)
+		if err != nil {
+			return persisted, changed, err
+		}
+		persisted++
+		if wasChanged {
+			changed++
 		}
 	}
-	return nil
+	return persisted, changed, nil
 }
 
 func rowsForCase(rows []courtview.SearchResultRow, caseNumber string) []courtview.SearchResultRow {
@@ -368,6 +620,150 @@ func parseDefendantNetworkOptions(w http.ResponseWriter, r *http.Request) (bool,
 	}
 
 	return includeNetwork, maxRelatedParties, maxRelatedCases, true
+}
+
+func parseBackfillOptions(w http.ResponseWriter, r *http.Request) (backfillRequest, bool) {
+	nowYear := time.Now().UTC().Year() % 100
+	req := backfillRequest{
+		Count:                   100,
+		YearTwoDigits:           nowYear,
+		StartSequence:           1,
+		MaxAttempts:             5000,
+		TimeoutSeconds:          900,
+		IncludeDefendantNetwork: false,
+		MaxRelatedParties:       10,
+		MaxRelatedCases:         100,
+	}
+
+	if raw := strings.TrimSpace(r.URL.Query().Get("count")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > 500 {
+			writeError(w, http.StatusBadRequest, "count must be an integer between 1 and 500")
+			return backfillRequest{}, false
+		}
+		req.Count = n
+	}
+
+	if raw := strings.TrimSpace(r.URL.Query().Get("year")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "year must be an integer")
+			return backfillRequest{}, false
+		}
+		switch {
+		case n >= 2000 && n <= 2099:
+			req.YearTwoDigits = n % 100
+		case n >= 0 && n <= 99:
+			req.YearTwoDigits = n
+		default:
+			writeError(w, http.StatusBadRequest, "year must be between 2000-2099 or 0-99")
+			return backfillRequest{}, false
+		}
+	}
+
+	if raw := strings.TrimSpace(r.URL.Query().Get("start_seq")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > 99999 {
+			writeError(w, http.StatusBadRequest, "start_seq must be an integer between 1 and 99999")
+			return backfillRequest{}, false
+		}
+		req.StartSequence = n
+	}
+
+	if raw := strings.TrimSpace(r.URL.Query().Get("max_attempts")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < req.Count || n > 50000 {
+			writeError(w, http.StatusBadRequest, "max_attempts must be an integer between count and 50000")
+			return backfillRequest{}, false
+		}
+		req.MaxAttempts = n
+	}
+
+	if raw := strings.TrimSpace(r.URL.Query().Get("timeout_seconds")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 10 || n > 7200 {
+			writeError(w, http.StatusBadRequest, "timeout_seconds must be an integer between 10 and 7200")
+			return backfillRequest{}, false
+		}
+		req.TimeoutSeconds = n
+	}
+
+	if raw := strings.TrimSpace(r.URL.Query().Get("include_defendant_network")); raw != "" {
+		b, err := strconv.ParseBool(raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "include_defendant_network must be true or false")
+			return backfillRequest{}, false
+		}
+		req.IncludeDefendantNetwork = b
+	}
+
+	if raw := strings.TrimSpace(r.URL.Query().Get("max_related_parties")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > 100 {
+			writeError(w, http.StatusBadRequest, "max_related_parties must be an integer between 1 and 100")
+			return backfillRequest{}, false
+		}
+		req.MaxRelatedParties = n
+	}
+
+	if raw := strings.TrimSpace(r.URL.Query().Get("max_related_cases")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > 1000 {
+			writeError(w, http.StatusBadRequest, "max_related_cases must be an integer between 1 and 1000")
+			return backfillRequest{}, false
+		}
+		req.MaxRelatedCases = n
+	}
+
+	return req, true
+}
+
+func formatAnchorageCriminalCaseNumber(yearTwoDigits, seq int) string {
+	return fmt.Sprintf("3AN-%02d-%05dCR", yearTwoDigits%100, seq)
+}
+
+func calculateDurationStats(samples []float64) durationStats {
+	if len(samples) == 0 {
+		return durationStats{}
+	}
+	copied := make([]float64, len(samples))
+	copy(copied, samples)
+	sort.Float64s(copied)
+
+	sum := 0.0
+	for _, v := range copied {
+		sum += v
+	}
+
+	return durationStats{
+		Count: len(copied),
+		MinMS: copied[0],
+		AvgMS: sum / float64(len(copied)),
+		P50MS: percentile(copied, 50),
+		P90MS: percentile(copied, 90),
+		P95MS: percentile(copied, 95),
+		MaxMS: copied[len(copied)-1],
+	}
+}
+
+func percentile(sorted []float64, p int) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	if p <= 0 {
+		return sorted[0]
+	}
+	if p >= 100 {
+		return sorted[len(sorted)-1]
+	}
+	index := (float64(p) / 100.0) * float64(len(sorted)-1)
+	lower := int(index)
+	upper := lower + 1
+	if upper >= len(sorted) {
+		return sorted[lower]
+	}
+	frac := index - float64(lower)
+	return sorted[lower] + frac*(sorted[upper]-sorted[lower])
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

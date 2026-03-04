@@ -28,8 +28,29 @@ Production-oriented API for Alaska CourtView with:
     - `include_defendant_network` (default `true`)
     - `max_related_parties` (default `10`)
     - `max_related_cases` (default `100`)
+- `POST /v1/admin/backfill/anchorage-criminal` (also accepts `GET`)
+  - purpose: pull and persist the first N Anchorage criminal (`CR`) cases for a given year
+  - defaults: `count=100`, `year=current year`, `start_seq=1`, `max_attempts=5000`
+  - optional:
+    - `timeout_seconds` (default `900`)
+    - `include_defendant_network` (default `false`)
+    - `max_related_parties` (default `10`)
+    - `max_related_cases` (default `100`)
 
 When using `search/case`, the API identifies defendant/co-defendant parties on the case and expands to their additional case records.
+
+Example backfill call:
+
+```bash
+curl -X POST "http://localhost:8088/v1/admin/backfill/anchorage-criminal?count=100"
+```
+
+Backfill response includes pull metrics:
+
+- total duration
+- attempts/sec and cases/sec
+- stage timing stats (`attempt`, `search`, optional `expand`, `persist`) with min/avg/p50/p90/p95/max
+- error counts and sample errors
 
 ## Case-number normalization
 
