@@ -95,6 +95,14 @@ DB:
 - `DB_LOG_MAX_SIZE_MB` (default `10`, log file budget in MB)
 - `DB_PURGE_TARGET_MB` (default `80`, data-file usage target after purge)
 
+Container image defaults:
+
+- `DB_MAX_SIZE_MB=100`
+- `DB_LOG_MAX_SIZE_MB=10`
+- `DB_PURGE_TARGET_MB=80`
+
+Override at runtime with `docker run -e ...` or in compose env.
+
 ## T-SQL schema reference
 
 - `sql/schema.sql`

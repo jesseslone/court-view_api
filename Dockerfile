@@ -22,6 +22,9 @@ COPY --from=build /out/courtview-api /usr/local/bin/courtview-api
 
 ENV SERVICE_ADDR=:8088
 ENV COURTVIEW_BASE_URL=https://records.courts.alaska.gov/eaccess/home.page.2
+ENV DB_MAX_SIZE_MB=100
+ENV DB_LOG_MAX_SIZE_MB=10
+ENV DB_PURGE_TARGET_MB=80
 
 EXPOSE 8088
 USER app
