@@ -1,20 +1,37 @@
 # CourtView Scraper API (Go)
 
-Production-oriented API service for querying Alaska CourtView and returning structured JSON.
+Production-oriented API for Alaska CourtView with:
 
-## Current capabilities
+- direct CourtView scraping (no runtime browser)
+- case-number normalization
+- pagination traversal
+- SQL Server (T-SQL) persistence and retention
+
+## Endpoints
 
 - `GET /healthz`
 - `GET /v1/search/name`
   - required: `first`, `last`
-  - optional: `dob`, `include_cases`, `max_cases`, `all_pages`, `max_pages`
+  - optional:
+    - `dob`
+    - `include_cases` (default `true`)
+    - `max_cases` (default `25`)
+    - `all_pages` (default `true`)
+    - `max_pages` (default `20`)
 - `GET /v1/search/case`
   - required: `case_number` (or `case`)
-  - optional: `include_cases`, `max_cases`, `all_pages`, `max_pages`
+  - optional:
+    - `include_cases` (default `true`)
+    - `max_cases` (default `25`)
+    - `all_pages` (default `true`)
+    - `max_pages` (default `20`)
+    - `include_defendant_network` (default `true`)
+    - `max_related_parties` (default `10`)
+    - `max_related_cases` (default `100`)
+
+When using `search/case`, the API identifies defendant/co-defendant parties on the case and expands to their additional case records.
 
 ## Case-number normalization
-
-Common malformed case-number inputs are normalized before search.
 
 Examples:
 
@@ -22,19 +39,21 @@ Examples:
 - `3AN1100123` -> `3AN-11-00123CR`
 - `3KE-25-184cr` -> `3KE-25-00184CR`
 
-## Pagination behavior
+## SQL Server behavior
 
-Pagination is enabled by default.
+On startup (when DB is enabled), the service:
 
-- `all_pages` default: `true`
-- `max_pages` default: `20`
+1. ensures database exists
+2. applies schema
+3. sets DB file max size defaults (`100MB` total budget split across data/log files, default `90MB` data + `10MB` log)
 
-The API response includes:
+On writes, the service:
 
-- `results`: aggregated rows across collected pages
-- `results_pages`: per-page raw result payloads
+- compares case payload hash (`payload_hash`) to existing record
+- updates only when changed (or touches query timestamp if unchanged)
+- purges oldest case records as capacity is approached (oldest `last_query_at` first)
 
-## Local run
+## Local run (without DB)
 
 ```bash
 go mod tidy
@@ -42,42 +61,44 @@ go test ./...
 go run ./cmd/courtview-api
 ```
 
-Default bind: `:8088`
+## Docker Compose (API + SQL Server)
 
-Environment variables:
+```bash
+# optional: provide a strong SA password
+export MSSQL_SA_PASSWORD='YourStrongPassword!123'
+
+docker compose up --build -d
+```
+
+Services:
+
+- API: `http://localhost:8088`
+- SQL Server: `localhost:14333`
+
+## Environment variables
+
+Core:
 
 - `SERVICE_ADDR` (default `:8088`)
 - `COURTVIEW_BASE_URL` (default `https://records.courts.alaska.gov/eaccess/home.page.2`)
 
-## Docker
+DB:
 
-Build and run:
+- `DB_ENABLED` (`true`/`false`)
+- `DB_HOST` (default `sqlserver`)
+- `DB_PORT` (default `1433`)
+- `DB_USER` (default `sa`)
+- `DB_PASSWORD` (required when DB enabled)
+- `DB_NAME` (default `courtview`)
+- `DB_ENCRYPT` (default `disable`)
+- `DB_MAX_SIZE_MB` (default `100`, total SQL data+log file budget in MB)
+- `DB_LOG_MAX_SIZE_MB` (default `10`, log file budget in MB)
+- `DB_PURGE_TARGET_MB` (default `80`, data-file usage target after purge)
 
-```bash
-docker build -t courtview-api:latest .
-docker run --rm -p 8088:8088 --name courtview-api courtview-api:latest
-```
-
-With compose:
-
-```bash
-docker compose up --build -d
-```
-
-## Database schema
-
-Suggested relational schema for persistence and sync metadata:
+## T-SQL schema reference
 
 - `sql/schema.sql`
 
-Includes:
+## Clean history
 
-- person/case/charge/disposition/event/docket tables
-- `source_hash` fields for change detection
-- sync run/error tables
-
-## Clean-repo guidance
-
-If you need guaranteed clean history, create a brand-new repository from this sanitized working tree and do not push old history.
-
-Reference steps are in `docs/clean-history.md`.
+- `docs/clean-history.md`

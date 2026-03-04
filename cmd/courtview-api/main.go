@@ -1,13 +1,16 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"courtview_lookup/internal/api"
 	"courtview_lookup/internal/courtview"
+	"courtview_lookup/internal/store/sqlserver"
 )
 
 func main() {
@@ -25,7 +28,16 @@ func main() {
 		log.Fatalf("failed to create courtview client: %v", err)
 	}
 
-	server := api.NewServer(client)
+	initCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	store, err := sqlserver.NewFromEnv(initCtx)
+	if err != nil {
+		log.Fatalf("failed to initialize sqlserver store: %v", err)
+	}
+	defer store.Close()
+
+	server := api.NewServer(client, store)
 	log.Printf("courtview api listening on %s", addr)
 	if err := http.ListenAndServe(addr, server.Handler()); err != nil {
 		log.Fatalf("server stopped: %v", err)

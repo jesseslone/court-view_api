@@ -1,137 +1,60 @@
--- CourtView extraction schema (PostgreSQL)
+-- SQL Server (T-SQL) schema used by the API service.
+--
+-- The service applies this shape automatically on startup when DB is enabled.
+-- This file is provided for review/manual execution.
 
-create table if not exists persons (
-    id bigserial primary key,
-    source_person_key text not null,
-    first_name text,
-    middle_name text,
-    last_name text,
-    suffix text,
-    date_of_birth date,
-    date_of_death date,
-    normalized_name text,
-    first_seen_at timestamptz not null default now(),
-    last_seen_at timestamptz not null default now(),
-    source_hash text not null,
-    unique (source_person_key)
-);
+IF OBJECT_ID(N'dbo.case_records', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.case_records (
+        case_number NVARCHAR(64) NOT NULL PRIMARY KEY,
+        source_url NVARCHAR(2048) NULL,
+        payload NVARCHAR(MAX) NOT NULL,
+        payload_hash CHAR(64) NOT NULL,
+        created_at DATETIME2 NOT NULL,
+        updated_at DATETIME2 NOT NULL,
+        last_query_at DATETIME2 NOT NULL
+    );
+END
+GO
 
-create table if not exists cases (
-    id bigserial primary key,
-    case_number text not null,
-    case_url text,
-    case_type text,
-    case_status text,
-    file_date date,
-    court_location text,
-    atn text,
-    first_seen_at timestamptz not null default now(),
-    last_seen_at timestamptz not null default now(),
-    last_activity_date date,
-    source_hash text not null,
-    unique (case_number)
-);
+IF OBJECT_ID(N'dbo.case_parties', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.case_parties (
+        id BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+        case_number NVARCHAR(64) NOT NULL,
+        role NVARCHAR(128) NULL,
+        full_name NVARCHAR(256) NULL,
+        first_name NVARCHAR(128) NULL,
+        last_name NVARCHAR(128) NULL,
+        dob NVARCHAR(32) NULL,
+        normalized_name NVARCHAR(256) NULL,
+        last_seen_at DATETIME2 NOT NULL,
+        CONSTRAINT FK_case_parties_case_records
+            FOREIGN KEY (case_number)
+            REFERENCES dbo.case_records(case_number)
+            ON DELETE CASCADE
+    );
+END
+GO
 
-create table if not exists person_case_roles (
-    id bigserial primary key,
-    person_id bigint not null references persons(id) on delete cascade,
-    case_id bigint not null references cases(id) on delete cascade,
-    party_type text,
-    affiliation text,
-    source_hash text not null,
-    first_seen_at timestamptz not null default now(),
-    last_seen_at timestamptz not null default now(),
-    unique (person_id, case_id, coalesce(party_type, ''), coalesce(affiliation, ''))
-);
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = N'idx_case_parties_normalized_name'
+      AND object_id = OBJECT_ID(N'dbo.case_parties')
+)
+BEGIN
+    CREATE INDEX idx_case_parties_normalized_name
+    ON dbo.case_parties (normalized_name, last_seen_at DESC);
+END
+GO
 
-create table if not exists charges (
-    id bigserial primary key,
-    case_id bigint not null references cases(id) on delete cascade,
-    tracking_number text,
-    count_number text,
-    statute text,
-    charge_text text,
-    offense_date date,
-    charge_date date,
-    stage_date date,
-    source_hash text not null,
-    first_seen_at timestamptz not null default now(),
-    last_seen_at timestamptz not null default now()
-);
-
-create table if not exists charge_dispositions (
-    id bigserial primary key,
-    charge_id bigint not null references charges(id) on delete cascade,
-    disposition text,
-    disposition_date date,
-    sentence_text text,
-    source_hash text not null,
-    observed_at timestamptz not null default now()
-);
-
-create table if not exists case_events (
-    id bigserial primary key,
-    case_id bigint not null references cases(id) on delete cascade,
-    event_date date,
-    event_time text,
-    event_type text,
-    event_description text,
-    judicial_officer text,
-    location text,
-    source_hash text not null,
-    first_seen_at timestamptz not null default now(),
-    last_seen_at timestamptz not null default now()
-);
-
-create table if not exists docket_entries (
-    id bigserial primary key,
-    case_id bigint not null references cases(id) on delete cascade,
-    docket_date date,
-    docket_text text,
-    filed_by text,
-    source_hash text not null,
-    first_seen_at timestamptz not null default now(),
-    last_seen_at timestamptz not null default now()
-);
-
-create table if not exists case_snapshots (
-    id bigserial primary key,
-    case_id bigint not null references cases(id) on delete cascade,
-    source_hash text not null,
-    main_text_excerpt text,
-    raw_payload jsonb not null,
-    observed_at timestamptz not null default now(),
-    unique (case_id, source_hash)
-);
-
-create table if not exists sync_runs (
-    id bigserial primary key,
-    started_at timestamptz not null default now(),
-    finished_at timestamptz,
-    trigger_type text not null,
-    query_payload jsonb,
-    status text not null,
-    rows_found integer not null default 0,
-    cases_processed integer not null default 0,
-    error_count integer not null default 0,
-    message text
-);
-
-create table if not exists sync_errors (
-    id bigserial primary key,
-    sync_run_id bigint not null references sync_runs(id) on delete cascade,
-    case_number text,
-    case_url text,
-    error_text text not null,
-    created_at timestamptz not null default now()
-);
-
-create index if not exists idx_cases_status on cases(case_status);
-create index if not exists idx_cases_file_date on cases(file_date);
-create index if not exists idx_cases_last_activity_date on cases(last_activity_date);
-create index if not exists idx_person_name on persons(last_name, first_name, date_of_birth);
-create index if not exists idx_charges_case_id on charges(case_id);
-create index if not exists idx_events_case_id on case_events(case_id);
-create index if not exists idx_events_date on case_events(event_date);
-create index if not exists idx_dockets_case_id on docket_entries(case_id);
-create index if not exists idx_snapshots_case_id on case_snapshots(case_id, observed_at desc);
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = N'idx_case_records_last_query_at'
+      AND object_id = OBJECT_ID(N'dbo.case_records')
+)
+BEGIN
+    CREATE INDEX idx_case_records_last_query_at
+    ON dbo.case_records (last_query_at ASC);
+END
+GO

@@ -61,8 +61,9 @@ type CaseSearchRequest struct {
 }
 
 type CaseSearchResponse struct {
-	Request      CaseSearchRequest `json:"request"`
-	Results      SearchResults     `json:"results"`
-	ResultsPages []SearchResults   `json:"results_pages,omitempty"`
-	Cases        []CaseDetails     `json:"cases,omitempty"`
+	Request        CaseSearchRequest `json:"request"`
+	Results        SearchResults     `json:"results"`
+	ResultsPages   []SearchResults   `json:"results_pages,omitempty"`
+	Cases          []CaseDetails     `json:"cases,omitempty"`
+	RelatedParties []PartyRecord     `json:"related_parties,omitempty"`
 }

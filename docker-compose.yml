@@ -1,4 +1,23 @@
 services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: courtview-sqlserver
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: "Developer"
+      MSSQL_SA_PASSWORD: "${MSSQL_SA_PASSWORD:-ChangeThis_StrongP@ssw0rd!}"
+    ports:
+      - "14333:1433"
+    volumes:
+      - mssql_data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/1433'"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 25s
+
   courtview-api:
     build:
       context: .
@@ -6,9 +25,22 @@ services:
     image: courtview-api:latest
     container_name: courtview-api
     restart: unless-stopped
+    depends_on:
+      sqlserver:
+        condition: service_healthy
     environment:
       SERVICE_ADDR: ":8088"
       COURTVIEW_BASE_URL: "https://records.courts.alaska.gov/eaccess/home.page.2"
+      DB_ENABLED: "true"
+      DB_HOST: "sqlserver"
+      DB_PORT: "1433"
+      DB_USER: "sa"
+      DB_PASSWORD: "${MSSQL_SA_PASSWORD:-ChangeThis_StrongP@ssw0rd!}"
+      DB_NAME: "courtview"
+      DB_ENCRYPT: "disable"
+      DB_MAX_SIZE_MB: "100"
+      DB_LOG_MAX_SIZE_MB: "10"
+      DB_PURGE_TARGET_MB: "80"
     ports:
       - "8088:8088"
     healthcheck:
@@ -17,3 +49,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+volumes:
+  mssql_data:
