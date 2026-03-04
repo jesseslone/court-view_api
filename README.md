@@ -171,6 +171,7 @@ Override at runtime with `docker run -e ...` or in compose env.
 ## T-SQL schema reference
 
 - `sql/schema.sql`
+- `sql/schema_detailed.sql` (expanded analytics/reporting model for parties, charges, dispositions, events, dockets, and raw tab snapshots)
 
 ## Clean history
 
