@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,6 +30,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to create courtview client: %v", err)
 	}
+	fetchCaseTabs, err := boolFromEnv("COURTVIEW_FETCH_CASE_TABS", false)
+	if err != nil {
+		log.Fatalf("invalid COURTVIEW_FETCH_CASE_TABS: %v", err)
+	}
+	client.SetFetchCaseTabs(fetchCaseTabs)
 
 	initCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
@@ -66,4 +72,16 @@ func main() {
 	if err := http.ListenAndServe(addr, server.Handler()); err != nil {
 		log.Fatalf("server stopped: %v", err)
 	}
+}
+
+func boolFromEnv(key string, defaultValue bool) (bool, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return defaultValue, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, err
+	}
+	return b, nil
 }

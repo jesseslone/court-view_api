@@ -93,6 +93,9 @@ On writes, the service:
 
 - compares case payload hash (`payload_hash`) to existing record
 - updates detailed case data only when payload hash changes (otherwise only touches query/snapshot timestamps)
+- uses `Current/All Information` as the default authoritative case page (`COURTVIEW_FETCH_CASE_TABS=false`)
+- optionally fetches case sub-tabs when `COURTVIEW_FETCH_CASE_TABS=true` (best-effort, slower, and more prone to CourtView 5xx responses)
+- populates `cv_charges`/`cv_charge_dispositions` from structured tables, with text fallback from `Current/All Information` when charge tabs fail
 - tracks `last_observed_change_at` when a case/person profile materially changes
 - tracks `last_successful_payload_hash` and skips replacing good payloads with transient tab-fetch failure payloads
 - purges oldest case records as capacity is approached (oldest `last_query_at` first)
@@ -110,6 +113,50 @@ This defaults to SQLite at `./data/courtview.sqlite`.
 UI:
 
 - `http://localhost:8088/ui/`
+
+## Python examples
+
+Scripts are in `examples/python/` and use only Python stdlib (no extra deps).
+
+- `courtview_api_client.py`:
+  - minimal client for `health`, `name`, `case`, and `backfill` endpoints
+- `criminal_charge_report.py`:
+  - lookup by `--case-number` OR `--first/--last` (+ optional `--dob`, `--atn`)
+  - returns criminal defendant records
+  - includes only non-dismissed charges
+  - labels each charge as `original`, `amended`, `downgraded`, or `amended_downgraded`
+  - emits case-level conviction flag
+- `runtime_api_tests.py`:
+  - runs runtime integration checks with dynamically discovered defendants
+  - discovers subjects from backfilled Anchorage criminal cases
+  - prints only redacted subject IDs (no names in test output)
+
+Examples:
+
+```bash
+# 1) Case-number report (JSON to stdout, CSV to file)
+python3 examples/python/criminal_charge_report.py \
+  --base-url http://localhost:8088 \
+  --case-number 3AN-26-00001CR \
+  --include-defendant-network \
+  --csv-out examples/python/output/case-report.csv
+
+# 2) Name+DOB (+ optional ATN) report
+python3 examples/python/criminal_charge_report.py \
+  --base-url http://localhost:8088 \
+  --first Jane --last Doe --dob 01/02/1990 --atn 12345678
+
+# 3) Runtime integration checks against live API+DB
+python3 examples/python/runtime_api_tests.py \
+  --base-url http://localhost:8088 \
+  --year 2026 \
+  --backfill-count 25 \
+  --subject-count 3 \
+  --json-out examples/python/output/runtime-tests.json
+
+# 4) Fast local unit tests for extraction logic (no live data needed)
+python3 -m unittest discover -s examples/python -p 'test_*.py' -v
+```
 
 Outside-container benchmark example:
 
@@ -138,6 +185,9 @@ Service:
 ```bash
 # optional: provide a strong SA password
 export MSSQL_SA_PASSWORD='YourStrongPassword!123'
+
+# preflight: verify Docker VM free space for your SQL size budget
+./scripts/preflight_docker_storage.sh
 
 docker compose up --build -d
 ```
@@ -172,6 +222,7 @@ Core:
 
 - `SERVICE_ADDR` (default `:8088`)
 - `COURTVIEW_BASE_URL` (default `https://records.courts.alaska.gov/eaccess/home.page.2`)
+- `COURTVIEW_FETCH_CASE_TABS` (default `false`; set `true` to crawl case sub-tabs in addition to `All Information`)
 
 Provider selection:
 
@@ -204,6 +255,17 @@ Container image defaults:
 - `DB_PURGE_TARGET_MB=80`
 
 Override at runtime with `docker run -e ...` or in compose env.
+
+Docker storage preflight (for local SQL container):
+
+- `DOCKER_HEADROOM_MB` (default `2048`): extra MB required above data/log budgets
+- `DOCKER_SPACE_PROBE_IMAGE` (default `alpine:latest`): image used to run `df` inside Docker VM
+- check command:
+
+```bash
+DB_MAX_SIZE_MB=100 DB_LOG_MAX_SIZE_MB=10 DOCKER_HEADROOM_MB=2048 \
+./scripts/preflight_docker_storage.sh
+```
 
 ## SQL Server hardening options
 

@@ -26,3 +26,8 @@ data/
 
 # Archives and large captures
 *.zip
+
+# Local test/report outputs (may include personal data)
+examples/python/output/
+examples/python/*.csv
+examples/python/*.json

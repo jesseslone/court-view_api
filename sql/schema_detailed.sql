@@ -138,9 +138,20 @@ BEGIN
         offense_level NVARCHAR(64) NULL, -- Felony, Misdemeanor, Violation, etc.
         charge_date DATE NULL,
         offense_date DATE NULL,
+        stage_date DATE NULL,
         filing_date DATE NULL,
         is_attempt BIT NOT NULL DEFAULT 0,
         is_amended BIT NOT NULL DEFAULT 0,
+        offense_location NVARCHAR(256) NULL,
+        atn NVARCHAR(64) NULL,
+        tracking_number NVARCHAR(64) NULL,
+        dv_related BIT NULL,
+        original_charge_text NVARCHAR(MAX) NULL,
+        indicted_charge_text NVARCHAR(MAX) NULL,
+        amended_charge_text NVARCHAR(MAX) NULL,
+        modifiers NVARCHAR(512) NULL,
+        source_tab NVARCHAR(64) NULL,
+        source_row_index INT NULL,
         raw_row_json NVARCHAR(MAX) NULL,
         first_seen_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
         last_seen_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
@@ -404,6 +415,17 @@ IF NOT EXISTS (
 )
 BEGIN
     CREATE INDEX idx_cv_charges_case_sequence ON dbo.cv_charges (case_id, charge_sequence, last_seen_at DESC);
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = N'idx_cv_charge_dispositions_charge'
+      AND object_id = OBJECT_ID(N'dbo.cv_charge_dispositions')
+)
+BEGIN
+    CREATE INDEX idx_cv_charge_dispositions_charge
+    ON dbo.cv_charge_dispositions (charge_id, disposition_date, last_seen_at DESC);
 END
 GO
 

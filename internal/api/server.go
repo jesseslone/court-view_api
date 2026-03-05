@@ -320,6 +320,7 @@ func (s *Server) handleBackfillAnchorageCriminal(w http.ResponseWriter, r *http.
 			if req.Concurrency > 1 {
 				newClient, err := courtview.NewClient(s.client.BaseURL())
 				if err == nil {
+					newClient.SetFetchCaseTabs(s.client.FetchCaseTabsEnabled())
 					workerClient = newClient
 				}
 			}

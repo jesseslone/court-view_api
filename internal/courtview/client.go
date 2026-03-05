@@ -18,10 +18,16 @@ import (
 
 const defaultBaseURL = "https://records.courts.alaska.gov/eaccess/home.page.2"
 
+const (
+	casePageFetchMaxAttempts = 3
+	casePageFetchRetryDelay  = 350 * time.Millisecond
+)
+
 type Client struct {
-	baseURL    string
-	httpClient *http.Client
-	userAgent  string
+	baseURL       string
+	httpClient    *http.Client
+	userAgent     string
+	fetchCaseTabs bool
 }
 
 func (c *Client) BaseURL() string {
@@ -52,8 +58,23 @@ func NewClient(baseURL string) (*Client, error) {
 			Transport: transport,
 			Timeout:   60 * time.Second,
 		},
-		userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+		userAgent:     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+		fetchCaseTabs: false,
 	}, nil
+}
+
+func (c *Client) SetFetchCaseTabs(enabled bool) {
+	if c == nil {
+		return
+	}
+	c.fetchCaseTabs = enabled
+}
+
+func (c *Client) FetchCaseTabsEnabled() bool {
+	if c == nil {
+		return false
+	}
+	return c.fetchCaseTabs
 }
 
 func (c *Client) SearchByName(
@@ -551,7 +572,7 @@ func setIfEmpty(values url.Values, key, value string) {
 }
 
 func (c *Client) FetchCase(ctx context.Context, caseURL string) CaseDetails {
-	body, finalURL, _, err := c.get(ctx, caseURL, nil)
+	body, finalURL, _, err := c.getWithRetry(ctx, caseURL, nil, casePageFetchMaxAttempts)
 	if err != nil {
 		return CaseDetails{CaseURL: caseURL, Error: err.Error()}
 	}
@@ -574,6 +595,14 @@ func (c *Client) FetchCase(ctx context.Context, caseURL string) CaseDetails {
 			selectedLabel = t
 		}
 	})
+	if !c.fetchCaseTabs {
+		return CaseDetails{
+			CaseNumber: caseNumber,
+			CaseURL:    finalURL,
+			Current:    current,
+			Tabs:       tabs,
+		}
+	}
 	tabs[selectedLabel] = current
 
 	doc.Find(".tab-row li a").Each(func(_ int, a *goquery.Selection) {
@@ -592,7 +621,7 @@ func (c *Client) FetchCase(ctx context.Context, caseURL string) CaseDetails {
 			return
 		}
 		fullURL := absURL(finalURL, href)
-		tabBody, tabURL, _, tabErr := c.get(ctx, fullURL, nil)
+		tabBody, tabURL, _, tabErr := c.getWithRetry(ctx, fullURL, nil, casePageFetchMaxAttempts)
 		if tabErr != nil {
 			tabs[label] = PageSnapshot{URL: fullURL, Title: "", H1: "", Tabs: nil, LabelValues: map[string]string{}, Tables: nil, MainTextExcerpt: "tab fetch failed: " + tabErr.Error()}
 			return
@@ -638,6 +667,68 @@ func (c *Client) get(ctx context.Context, rawURL string, headers map[string]stri
 		return nil, resp.Request.URL.String(), resp.Header, fmt.Errorf("http %d for %s", resp.StatusCode, rawURL)
 	}
 	return body, resp.Request.URL.String(), resp.Header, nil
+}
+
+func (c *Client) getWithRetry(
+	ctx context.Context,
+	rawURL string,
+	headers map[string]string,
+	maxAttempts int,
+) ([]byte, string, http.Header, error) {
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		body, finalURL, respHeaders, err := c.get(ctx, rawURL, headers)
+		if err == nil {
+			return body, finalURL, respHeaders, nil
+		}
+		lastErr = err
+
+		if ctx.Err() != nil || attempt == maxAttempts || !isRetryableGetError(err) {
+			break
+		}
+
+		delay := time.Duration(attempt) * casePageFetchRetryDelay
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, "", nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+
+	return nil, "", nil, lastErr
+}
+
+func isRetryableGetError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	if msg == "" {
+		return false
+	}
+	retryableMarkers := []string{
+		"http 500",
+		"http 502",
+		"http 503",
+		"http 504",
+		"connection reset",
+		"connection refused",
+		"timeout",
+		"tls handshake timeout",
+		"eof",
+	}
+	for _, marker := range retryableMarkers {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Client) postForm(ctx context.Context, rawURL string, values url.Values, headers map[string]string) ([]byte, string, http.Header, error) {

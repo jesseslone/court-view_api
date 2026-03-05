@@ -493,12 +493,42 @@ type extractedDocket struct {
 	rawRowJSON   string
 }
 
+type extractedCharge struct {
+	sequence          int
+	chargeCode        string
+	chargeDescription string
+	statute           string
+	offenseLevel      string
+	chargeDate        *time.Time
+	offenseDate       *time.Time
+	stageDate         *time.Time
+	filingDate        *time.Time
+	isAttempt         bool
+	isAmended         bool
+	offenseLocation   string
+	atn               string
+	trackingNumber    string
+	dvRelated         *bool
+	originalCharge    string
+	indictedCharge    string
+	amendedCharge     string
+	modifiers         string
+	dispositionStatus string
+	dispositionDate   *time.Time
+	plea              string
+	sentenceSummary   string
+	sourceTab         string
+	sourceRowIdx      int
+	rawRowJSON        string
+}
+
 var (
-	reCaseType   = regexp.MustCompile(`(?i)Case Type:\s*(.+?)\s+Case Status:`)
-	reCaseStatus = regexp.MustCompile(`(?i)Case Status:\s*(.+?)\s+File Date:`)
-	reFileDate   = regexp.MustCompile(`(?i)File Date:\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})`)
-	reCaseJudge  = regexp.MustCompile(`(?i)Case Judge:\s*(.+?)(?:\s+Next Event:|\s+All Information|\s+Party Information|\s+Charge Information|\s+Event Information|\s+Docket Information|$)`)
-	reURLsInText = regexp.MustCompile(`https?://[^\s]+`)
+	reCaseType    = regexp.MustCompile(`(?i)Case Type:\s*(.+?)\s+Case Status:`)
+	reCaseStatus  = regexp.MustCompile(`(?i)Case Status:\s*(.+?)\s+File Date:`)
+	reFileDate    = regexp.MustCompile(`(?i)File Date:\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})`)
+	reCaseJudge   = regexp.MustCompile(`(?i)Case Judge:\s*(.+?)(?:\s+Next Event:|\s+All Information|\s+Party Information|\s+Charge Information|\s+Event Information|\s+Docket Information|$)`)
+	reURLsInText  = regexp.MustCompile(`https?://[^\s]+`)
+	reChargeStart = regexp.MustCompile(`(?i)Charge\s*#\s*([0-9]+)\s*:`)
 )
 
 func (s *Store) upsertDetailedCaseData(
@@ -578,6 +608,16 @@ ORDER BY captured_at DESC
 	}
 
 	if !needsDetailedRefresh {
+		refreshForMissingCharges, err := shouldRefreshForMissingCharges(ctx, tx, caseID, caseDetails)
+		if err != nil {
+			return err
+		}
+		if refreshForMissingCharges {
+			needsDetailedRefresh = true
+		}
+	}
+
+	if !needsDetailedRefresh {
 		if _, err := tx.ExecContext(ctx, `
 UPDATE cv_case_snapshots
 SET captured_at = @p2
@@ -619,6 +659,18 @@ VALUES (
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM cv_docket_entries WHERE case_id = @p1`, caseID); err != nil {
 		return fmt.Errorf("clear cv_docket_entries: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+DELETE FROM cv_charge_dispositions
+WHERE charge_id IN (
+    SELECT charge_id
+    FROM cv_charges
+    WHERE case_id = @p1
+)`, caseID); err != nil {
+		return fmt.Errorf("clear cv_charge_dispositions: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM cv_charges WHERE case_id = @p1`, caseID); err != nil {
+		return fmt.Errorf("clear cv_charges: %w", err)
 	}
 
 	parties := courtview.ExtractParties(rows)
@@ -668,6 +720,76 @@ INSERT INTO cv_docket_entries (
 )
 `, caseID, docket.docketDate, docket.docketText, docket.sequence, docket.sourceTab, docket.sourceRowIdx, docket.rawRowJSON, now); err != nil {
 			return fmt.Errorf("insert cv_docket_entries: %w", err)
+		}
+	}
+
+	primaryCasePartyID := sql.NullInt64{}
+	if err := tx.QueryRowContext(ctx, `
+SELECT TOP (1) case_party_id
+FROM cv_case_parties
+WHERE case_id = @p1
+  AND is_primary_defendant = 1
+ORDER BY case_party_id ASC
+`, caseID).Scan(&primaryCasePartyID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read primary defendant case_party_id: %w", err)
+	}
+
+	charges := extractCharges(caseDetails)
+	for _, charge := range charges {
+		if strings.TrimSpace(charge.chargeDescription) == "" && strings.TrimSpace(charge.statute) == "" && strings.TrimSpace(charge.chargeCode) == "" {
+			continue
+		}
+		chargeDescription := strings.TrimSpace(charge.chargeDescription)
+		if chargeDescription == "" {
+			chargeDescription = strings.TrimSpace(charge.originalCharge)
+		}
+		if chargeDescription == "" {
+			chargeDescription = strings.TrimSpace(charge.statute)
+		}
+		if chargeDescription == "" {
+			chargeDescription = strings.TrimSpace(charge.chargeCode)
+		}
+		if chargeDescription == "" {
+			continue
+		}
+
+		var chargeID int64
+		if err := tx.QueryRowContext(ctx, `
+INSERT INTO cv_charges (
+    case_id, case_party_id, charge_sequence, charge_code, charge_description, statute, offense_level,
+    charge_date, offense_date, stage_date, filing_date, is_attempt, is_amended,
+    offense_location, atn, tracking_number, dv_related,
+    original_charge_text, indicted_charge_text, amended_charge_text, modifiers,
+    source_tab, source_row_index, raw_row_json, first_seen_at, last_seen_at
+)
+OUTPUT INSERTED.charge_id
+VALUES (
+    @p1, @p2, @p3, @p4, @p5, @p6, @p7,
+    @p8, @p9, @p10, @p11, @p12, @p13,
+    @p14, @p15, @p16, @p17,
+    @p18, @p19, @p20, @p21,
+    @p22, @p23, @p24, @p25, @p25
+)
+`, caseID, primaryCasePartyID, nullablePositiveInt(charge.sequence), nullableString(charge.chargeCode), chargeDescription, nullableString(charge.statute), nullableString(charge.offenseLevel),
+			charge.chargeDate, charge.offenseDate, charge.stageDate, charge.filingDate, charge.isAttempt, charge.isAmended,
+			nullableString(charge.offenseLocation), nullableString(charge.atn), nullableString(charge.trackingNumber), nullableBool(charge.dvRelated),
+			nullableString(charge.originalCharge), nullableString(charge.indictedCharge), nullableString(charge.amendedCharge), nullableString(charge.modifiers),
+			nullableString(charge.sourceTab), nullablePositiveInt(charge.sourceRowIdx), nullableString(charge.rawRowJSON), now).Scan(&chargeID); err != nil {
+			return fmt.Errorf("insert cv_charges: %w", err)
+		}
+
+		if strings.TrimSpace(charge.dispositionStatus) == "" && charge.dispositionDate == nil && strings.TrimSpace(charge.plea) == "" && strings.TrimSpace(charge.sentenceSummary) == "" {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO cv_charge_dispositions (
+    charge_id, disposition_status, disposition_date, plea, sentence_summary, is_final, raw_row_json, first_seen_at, last_seen_at
+)
+VALUES (
+    @p1, @p2, @p3, @p4, @p5, @p6, @p7, @p8, @p8
+)
+`, chargeID, nullableString(charge.dispositionStatus), charge.dispositionDate, nullableString(charge.plea), nullableString(charge.sentenceSummary), isDispositionFinal(charge.dispositionStatus), nullableString(charge.rawRowJSON), now); err != nil {
+			return fmt.Errorf("insert cv_charge_dispositions: %w", err)
 		}
 	}
 
@@ -1055,6 +1177,23 @@ func combinedCaseText(caseDetails courtview.CaseDetails) string {
 	return strings.Join(parts, " ")
 }
 
+func shouldRefreshForMissingCharges(ctx context.Context, tx *sql.Tx, caseID int64, caseDetails courtview.CaseDetails) (bool, error) {
+	caseText := strings.ToLower(combinedCaseText(caseDetails))
+	hasChargeSignal := strings.Contains(caseText, "charge #") || strings.Contains(caseText, "charge information")
+	if !hasChargeSignal {
+		return false, nil
+	}
+	var chargeCount int
+	if err := tx.QueryRowContext(ctx, `
+SELECT COUNT(1)
+FROM cv_charges
+WHERE case_id = @p1
+`, caseID).Scan(&chargeCount); err != nil {
+		return false, fmt.Errorf("read cv_charges count: %w", err)
+	}
+	return chargeCount == 0, nil
+}
+
 func firstRegexGroup(re *regexp.Regexp, value string) string {
 	m := re.FindStringSubmatch(value)
 	if len(m) < 2 {
@@ -1134,6 +1273,436 @@ func extractEventsAndDockets(caseDetails courtview.CaseDetails) ([]extractedEven
 	}
 
 	return events, dockets
+}
+
+func extractCharges(caseDetails courtview.CaseDetails) []extractedCharge {
+	fromTables := extractChargesFromTables(caseDetails)
+	fromText := extractChargesFromTextFallback(caseDetails)
+	if len(fromText) == 0 {
+		return dedupeCharges(fromTables)
+	}
+	if len(fromTables) == 0 {
+		return dedupeCharges(fromText)
+	}
+	return dedupeCharges(mergeCharges(fromTables, fromText))
+}
+
+func extractChargesFromTables(caseDetails courtview.CaseDetails) []extractedCharge {
+	type pageItem struct {
+		name string
+		page courtview.PageSnapshot
+	}
+	tabNames := make([]string, 0, len(caseDetails.Tabs))
+	for name := range caseDetails.Tabs {
+		tabNames = append(tabNames, name)
+	}
+	sort.Strings(tabNames)
+
+	pages := make([]pageItem, 0, len(tabNames)+1)
+	pages = append(pages, pageItem{name: "Current", page: caseDetails.Current})
+	for _, name := range tabNames {
+		pages = append(pages, pageItem{name: name, page: caseDetails.Tabs[name]})
+	}
+
+	charges := make([]extractedCharge, 0)
+	for _, item := range pages {
+		for _, table := range item.page.Tables {
+			headerMap := normalizedHeaderIndex(table.Headers)
+			if !isChargeTable(headerMap) {
+				continue
+			}
+			for rowIndex, row := range table.Rows {
+				rowMap := rowToHeaderMap(table.Headers, row)
+				charge := extractedCharge{
+					sequence:          parseIntLoose(firstValue(rowMap, "charge #", "charge no", "count", "count #")),
+					chargeCode:        firstValue(rowMap, "charge code", "code"),
+					chargeDescription: firstValue(rowMap, "charge description", "charge", "count description", "offense", "offense description"),
+					statute:           firstValue(rowMap, "statute", "citation", "as", "law"),
+					offenseLevel:      firstValue(rowMap, "offense level", "charge level", "degree", "class", "severity"),
+					chargeDate:        parseFlexibleDate(firstValue(rowMap, "charge date")),
+					offenseDate:       parseFlexibleDate(firstValue(rowMap, "offense date", "date of offense")),
+					stageDate:         parseFlexibleDate(firstValue(rowMap, "stage date")),
+					dispositionStatus: firstValue(rowMap, "disposition", "result", "judgment", "status"),
+					dispositionDate:   parseFlexibleDate(firstValue(rowMap, "disposition date")),
+					plea:              firstValue(rowMap, "plea"),
+					sentenceSummary:   firstValue(rowMap, "sentence", "sentence summary"),
+					offenseLocation:   firstValue(rowMap, "offense location", "location"),
+					atn:               firstValue(rowMap, "atn", "atn #"),
+					trackingNumber:    firstValue(rowMap, "tracking #", "tracking number"),
+					originalCharge:    firstValue(rowMap, "original charge"),
+					indictedCharge:    firstValue(rowMap, "indicted charge"),
+					amendedCharge:     firstValue(rowMap, "amended charge"),
+					modifiers:         firstValue(rowMap, "modifiers"),
+					sourceTab:         item.name,
+					sourceRowIdx:      rowIndex + 1,
+					rawRowJSON:        marshalToJSONString(rowMap),
+				}
+				if charge.chargeDescription == "" {
+					charge.chargeDescription = firstValueByHeaderContains(rowMap, "charge")
+				}
+				if charge.statute == "" {
+					charge.statute = firstValueByHeaderContains(rowMap, "statute")
+				}
+				if charge.offenseLevel == "" {
+					charge.offenseLevel = classifyOffenseLevel(charge.chargeDescription + " " + charge.originalCharge + " " + charge.amendedCharge)
+				}
+				dv := parseBoolLoose(firstValue(rowMap, "dv related?", "dv related"))
+				charge.dvRelated = dv
+				charge.isAttempt = strings.Contains(strings.ToLower(charge.chargeDescription), "attempt")
+				charge.isAmended = isAmendedCharge(charge.amendedCharge, charge.chargeDescription, charge.dispositionStatus)
+				if charge.chargeCode == "" {
+					charge.chargeCode = firstStatuteLikeToken(charge.chargeDescription)
+				}
+				if charge.chargeDescription == "" && charge.statute == "" && charge.chargeCode == "" && charge.dispositionStatus == "" {
+					continue
+				}
+				charges = append(charges, charge)
+			}
+		}
+	}
+	return charges
+}
+
+func extractChargesFromTextFallback(caseDetails courtview.CaseDetails) []extractedCharge {
+	text := combinedCaseText(caseDetails)
+	text = strings.Join(strings.Fields(text), " ")
+	if text == "" {
+		return nil
+	}
+	startMatches := reChargeStart.FindAllStringSubmatchIndex(text, -1)
+	if len(startMatches) == 0 {
+		return nil
+	}
+
+	out := make([]extractedCharge, 0, len(startMatches))
+	for i, match := range startMatches {
+		if len(match) < 4 {
+			continue
+		}
+		blockStart := match[1]
+		blockEnd := len(text)
+		if i+1 < len(startMatches) {
+			blockEnd = startMatches[i+1][0]
+		}
+		sequence := parseIntLoose(text[match[2]:match[3]])
+		block := strings.TrimSpace(text[blockStart:blockEnd])
+		if block == "" {
+			continue
+		}
+
+		header := firstRegexGroup(regexp.MustCompile(`(?i)^\s*(.*?)(?:\s+Original Charge|\s+Indicted Charge|\s+Amended Charge|\s+DV Related\?|\s+Modifiers|\s+Stage Date|\s+ATN\s*#|\s+Tracking\s*#|\s+Offense Location|\s+Date of Offense|$)`), block)
+		chargeCode := firstRegexGroup(regexp.MustCompile(`(?i)^\s*([A-Z]{2,}[A-Z0-9.-]+)\b`), header)
+		chargeDescription := header
+		if parts := strings.SplitN(header, " - ", 2); len(parts) == 2 {
+			if chargeCode == "" {
+				chargeCode = strings.TrimSpace(parts[0])
+			}
+			chargeDescription = strings.TrimSpace(parts[1])
+		}
+		if chargeDescription == "" {
+			chargeDescription = header
+		}
+
+		originalCharge := firstRegexGroup(regexp.MustCompile(`(?i)Original Charge\s*(.*?)\s*(?:Indicted Charge|Amended Charge|DV Related\?|Modifiers|Stage Date|ATN\s*#|Tracking\s*#|Offense Location|Date of Offense|$)`), block)
+		indictedCharge := firstRegexGroup(regexp.MustCompile(`(?i)Indicted Charge\s*(.*?)\s*(?:Amended Charge|DV Related\?|Modifiers|Stage Date|ATN\s*#|Tracking\s*#|Offense Location|Date of Offense|$)`), block)
+		amendedCharge := firstRegexGroup(regexp.MustCompile(`(?i)Amended Charge\s*(.*?)\s*(?:DV Related\?|Modifiers|Stage Date|ATN\s*#|Tracking\s*#|Offense Location|Date of Offense|$)`), block)
+		modifiers := firstRegexGroup(regexp.MustCompile(`(?i)Modifiers\s*(.*?)\s*(?:Stage Date|ATN\s*#|Tracking\s*#|Offense Location|Date of Offense|$)`), block)
+
+		statute := firstStatuteLikeToken(originalCharge)
+		if statute == "" {
+			statute = firstStatuteLikeToken(header)
+		}
+		offenseLevel := classifyOffenseLevel(strings.Join([]string{header, originalCharge, amendedCharge}, " "))
+		stageDate := parseFlexibleDate(firstRegexGroup(regexp.MustCompile(`(?i)Stage Date\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})`), block))
+		offenseDate := parseFlexibleDate(firstRegexGroup(regexp.MustCompile(`(?i)Date of Offense\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})`), block))
+		atn := firstRegexGroup(regexp.MustCompile(`(?i)\bATN\s*#\s*([A-Za-z0-9-]+)\b`), block)
+		trackingNumber := firstRegexGroup(regexp.MustCompile(`(?i)\bTracking\s*#\s*([A-Za-z0-9-]+)\b`), block)
+		offenseLocation := firstRegexGroup(regexp.MustCompile(`(?i)\bOffense Location\s*(.*?)\s*(?:Date of Offense|$)`), block)
+		dvRelated := parseBoolLoose(firstRegexGroup(regexp.MustCompile(`(?i)\bDV Related\?\s*(Yes|No)\b`), block))
+		dispositionStatus := firstRegexGroup(regexp.MustCompile(`(?i)\bDisposition\s*:?\s*(.*?)\s*(?:Original Charge|Indicted Charge|Amended Charge|DV Related\?|Modifiers|Stage Date|ATN\s*#|Tracking\s*#|Offense Location|Date of Offense|$)`), block)
+
+		rawJSON := marshalToJSONString(map[string]any{
+			"source": "CurrentTextFallback",
+			"block":  block,
+		})
+		out = append(out, extractedCharge{
+			sequence:          sequence,
+			chargeCode:        strings.TrimSpace(chargeCode),
+			chargeDescription: strings.TrimSpace(chargeDescription),
+			statute:           strings.TrimSpace(statute),
+			offenseLevel:      strings.TrimSpace(offenseLevel),
+			stageDate:         stageDate,
+			offenseDate:       offenseDate,
+			offenseLocation:   strings.TrimSpace(offenseLocation),
+			atn:               strings.TrimSpace(atn),
+			trackingNumber:    strings.TrimSpace(trackingNumber),
+			dvRelated:         dvRelated,
+			originalCharge:    strings.TrimSpace(originalCharge),
+			indictedCharge:    strings.TrimSpace(indictedCharge),
+			amendedCharge:     strings.TrimSpace(amendedCharge),
+			modifiers:         strings.TrimSpace(modifiers),
+			dispositionStatus: strings.TrimSpace(dispositionStatus),
+			isAttempt:         strings.Contains(strings.ToLower(chargeDescription), "attempt"),
+			isAmended:         isAmendedCharge(amendedCharge, chargeDescription, dispositionStatus),
+			sourceTab:         "CurrentTextFallback",
+			sourceRowIdx:      sequence,
+			rawRowJSON:        rawJSON,
+		})
+	}
+
+	return out
+}
+
+func mergeCharges(primary, fallback []extractedCharge) []extractedCharge {
+	out := append([]extractedCharge(nil), primary...)
+	bySequence := make(map[int]int, len(out))
+	for i, charge := range out {
+		if charge.sequence > 0 {
+			bySequence[charge.sequence] = i
+		}
+	}
+	for _, extra := range fallback {
+		if extra.sequence > 0 {
+			if idx, ok := bySequence[extra.sequence]; ok {
+				out[idx] = mergeChargeRecord(out[idx], extra)
+				continue
+			}
+		}
+		out = append(out, extra)
+		if extra.sequence > 0 {
+			bySequence[extra.sequence] = len(out) - 1
+		}
+	}
+	return out
+}
+
+func mergeChargeRecord(base, extra extractedCharge) extractedCharge {
+	if base.chargeCode == "" {
+		base.chargeCode = extra.chargeCode
+	}
+	if base.chargeDescription == "" {
+		base.chargeDescription = extra.chargeDescription
+	}
+	if base.statute == "" {
+		base.statute = extra.statute
+	}
+	if base.offenseLevel == "" {
+		base.offenseLevel = extra.offenseLevel
+	}
+	if base.chargeDate == nil {
+		base.chargeDate = extra.chargeDate
+	}
+	if base.offenseDate == nil {
+		base.offenseDate = extra.offenseDate
+	}
+	if base.stageDate == nil {
+		base.stageDate = extra.stageDate
+	}
+	if base.filingDate == nil {
+		base.filingDate = extra.filingDate
+	}
+	if base.offenseLocation == "" {
+		base.offenseLocation = extra.offenseLocation
+	}
+	if base.atn == "" {
+		base.atn = extra.atn
+	}
+	if base.trackingNumber == "" {
+		base.trackingNumber = extra.trackingNumber
+	}
+	if base.dvRelated == nil {
+		base.dvRelated = extra.dvRelated
+	}
+	if base.originalCharge == "" {
+		base.originalCharge = extra.originalCharge
+	}
+	if base.indictedCharge == "" {
+		base.indictedCharge = extra.indictedCharge
+	}
+	if base.amendedCharge == "" {
+		base.amendedCharge = extra.amendedCharge
+	}
+	if base.modifiers == "" {
+		base.modifiers = extra.modifiers
+	}
+	if base.dispositionStatus == "" {
+		base.dispositionStatus = extra.dispositionStatus
+	}
+	if base.dispositionDate == nil {
+		base.dispositionDate = extra.dispositionDate
+	}
+	if base.plea == "" {
+		base.plea = extra.plea
+	}
+	if base.sentenceSummary == "" {
+		base.sentenceSummary = extra.sentenceSummary
+	}
+	base.isAttempt = base.isAttempt || extra.isAttempt
+	base.isAmended = base.isAmended || extra.isAmended
+	if base.sourceTab == "" {
+		base.sourceTab = extra.sourceTab
+	}
+	if base.sourceRowIdx == 0 {
+		base.sourceRowIdx = extra.sourceRowIdx
+	}
+	if base.rawRowJSON == "" {
+		base.rawRowJSON = extra.rawRowJSON
+	}
+	return base
+}
+
+func dedupeCharges(charges []extractedCharge) []extractedCharge {
+	seen := make(map[string]struct{}, len(charges))
+	out := make([]extractedCharge, 0, len(charges))
+	for _, charge := range charges {
+		if charge.offenseLevel == "" {
+			charge.offenseLevel = classifyOffenseLevel(strings.Join([]string{
+				charge.chargeDescription,
+				charge.originalCharge,
+				charge.amendedCharge,
+			}, " "))
+		}
+		if charge.chargeCode == "" {
+			charge.chargeCode = firstStatuteLikeToken(charge.chargeDescription)
+		}
+		key := strings.ToLower(strings.Join([]string{
+			strconv.Itoa(charge.sequence),
+			strings.TrimSpace(charge.chargeCode),
+			strings.TrimSpace(charge.chargeDescription),
+			strings.TrimSpace(charge.statute),
+			strings.TrimSpace(charge.dispositionStatus),
+			formatDateForKey(charge.offenseDate),
+		}, "|"))
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, charge)
+	}
+	return out
+}
+
+func isChargeTable(headerMap map[string]int) bool {
+	hasChargeHint := containsHeader(headerMap, "charge") || containsHeader(headerMap, "offense") || containsHeader(headerMap, "count")
+	if !hasChargeHint {
+		return false
+	}
+	hasDetail := containsHeader(headerMap, "statute") ||
+		containsHeader(headerMap, "disposition") ||
+		containsHeader(headerMap, "level") ||
+		containsHeader(headerMap, "degree") ||
+		containsHeader(headerMap, "class") ||
+		containsHeader(headerMap, "date of offense") ||
+		containsHeader(headerMap, "offense date") ||
+		containsHeader(headerMap, "amended charge")
+	return hasDetail
+}
+
+func containsHeader(headerMap map[string]int, snippet string) bool {
+	snippet = normalizeHeader(snippet)
+	for key := range headerMap {
+		if strings.Contains(key, snippet) {
+			return true
+		}
+	}
+	return false
+}
+
+func firstValueByHeaderContains(values map[string]string, snippet string) string {
+	snippet = normalizeHeader(snippet)
+	for key, value := range values {
+		if strings.Contains(key, snippet) && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func parseIntLoose(value string) int {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(value)
+	if err == nil {
+		return n
+	}
+	m := regexp.MustCompile(`\d+`).FindString(value)
+	if m == "" {
+		return 0
+	}
+	n, err = strconv.Atoi(m)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+func parseBoolLoose(value string) *bool {
+	v := strings.ToLower(strings.TrimSpace(value))
+	switch v {
+	case "yes", "y", "true", "1":
+		b := true
+		return &b
+	case "no", "n", "false", "0":
+		b := false
+		return &b
+	default:
+		return nil
+	}
+}
+
+func isAmendedCharge(amendedCharge, chargeDescription, disposition string) bool {
+	if v := strings.TrimSpace(amendedCharge); v != "" {
+		lv := strings.ToLower(v)
+		if lv != "none" && lv != "no" && lv != "n/a" {
+			return true
+		}
+	}
+	bucket := strings.ToLower(strings.Join([]string{chargeDescription, disposition}, " "))
+	return strings.Contains(bucket, "amend")
+}
+
+func firstStatuteLikeToken(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	re := regexp.MustCompile(`(?i)\b([A-Z]{2,}[A-Z0-9()./-]*[0-9][A-Z0-9()./-]*)\b`)
+	m := re.FindStringSubmatch(value)
+	if len(m) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(m[1])
+}
+
+func classifyOffenseLevel(value string) string {
+	v := strings.ToLower(strings.TrimSpace(value))
+	switch {
+	case strings.Contains(v, "unclassified felony"):
+		return "Unclassified Felony"
+	case strings.Contains(v, "class a felony"), strings.Contains(v, "felony a"):
+		return "Class A Felony"
+	case strings.Contains(v, "class b felony"), strings.Contains(v, "felony b"):
+		return "Class B Felony"
+	case strings.Contains(v, "class c felony"), strings.Contains(v, "felony c"):
+		return "Class C Felony"
+	case strings.Contains(v, "class a misdemeanor"), strings.Contains(v, "misdemeanor a"):
+		return "Class A Misdemeanor"
+	case strings.Contains(v, "class b misdemeanor"), strings.Contains(v, "misdemeanor b"):
+		return "Class B Misdemeanor"
+	case strings.Contains(v, "violation"):
+		return "Violation"
+	default:
+		return ""
+	}
+}
+
+func formatDateForKey(t *time.Time) string {
+	if t == nil {
+		return ""
+	}
+	return t.UTC().Format("2006-01-02")
 }
 
 func partyRoleGroup(role string) string {
@@ -1256,6 +1825,50 @@ func marshalToJSONString(value any) string {
 		return "{}"
 	}
 	return string(b)
+}
+
+func nullableString(value string) sql.NullString {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: v, Valid: true}
+}
+
+func nullablePositiveInt(value int) sql.NullInt64 {
+	if value <= 0 {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: int64(value), Valid: true}
+}
+
+func nullableBool(value *bool) sql.NullBool {
+	if value == nil {
+		return sql.NullBool{}
+	}
+	return sql.NullBool{Bool: *value, Valid: true}
+}
+
+func isDispositionFinal(status string) bool {
+	s := strings.ToLower(strings.TrimSpace(status))
+	if s == "" {
+		return false
+	}
+	finalMarkers := []string{
+		"dismiss",
+		"guilty",
+		"not guilty",
+		"acquitt",
+		"convict",
+		"sentenc",
+		"closed",
+	}
+	for _, marker := range finalMarkers {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func caseHasTransientTabFailures(caseDetails courtview.CaseDetails) bool {
@@ -1780,6 +2393,111 @@ BEGIN
             REFERENCES dbo.cv_people(person_id)
     );
 END`,
+		`IF OBJECT_ID(N'dbo.cv_charges', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.cv_charges (
+        charge_id BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+        case_id BIGINT NOT NULL,
+        case_party_id BIGINT NULL,
+        charge_sequence INT NULL,
+        charge_code NVARCHAR(64) NULL,
+        charge_description NVARCHAR(1024) NOT NULL,
+        statute NVARCHAR(256) NULL,
+        offense_level NVARCHAR(64) NULL,
+        charge_date DATE NULL,
+        offense_date DATE NULL,
+        stage_date DATE NULL,
+        filing_date DATE NULL,
+        is_attempt BIT NOT NULL DEFAULT 0,
+        is_amended BIT NOT NULL DEFAULT 0,
+        offense_location NVARCHAR(256) NULL,
+        atn NVARCHAR(64) NULL,
+        tracking_number NVARCHAR(64) NULL,
+        dv_related BIT NULL,
+        original_charge_text NVARCHAR(MAX) NULL,
+        indicted_charge_text NVARCHAR(MAX) NULL,
+        amended_charge_text NVARCHAR(MAX) NULL,
+        modifiers NVARCHAR(512) NULL,
+        source_tab NVARCHAR(64) NULL,
+        source_row_index INT NULL,
+        raw_row_json NVARCHAR(MAX) NULL,
+        first_seen_at DATETIME2 NOT NULL,
+        last_seen_at DATETIME2 NOT NULL,
+        CONSTRAINT FK_cv_charges_case
+            FOREIGN KEY (case_id)
+            REFERENCES dbo.cv_cases(case_id)
+            ON DELETE CASCADE,
+        CONSTRAINT FK_cv_charges_case_party
+            FOREIGN KEY (case_party_id)
+            REFERENCES dbo.cv_case_parties(case_party_id)
+    );
+END`,
+		`IF COL_LENGTH(N'dbo.cv_charges', N'stage_date') IS NULL
+BEGIN
+    ALTER TABLE dbo.cv_charges ADD stage_date DATE NULL;
+END`,
+		`IF COL_LENGTH(N'dbo.cv_charges', N'offense_location') IS NULL
+BEGIN
+    ALTER TABLE dbo.cv_charges ADD offense_location NVARCHAR(256) NULL;
+END`,
+		`IF COL_LENGTH(N'dbo.cv_charges', N'atn') IS NULL
+BEGIN
+    ALTER TABLE dbo.cv_charges ADD atn NVARCHAR(64) NULL;
+END`,
+		`IF COL_LENGTH(N'dbo.cv_charges', N'tracking_number') IS NULL
+BEGIN
+    ALTER TABLE dbo.cv_charges ADD tracking_number NVARCHAR(64) NULL;
+END`,
+		`IF COL_LENGTH(N'dbo.cv_charges', N'dv_related') IS NULL
+BEGIN
+    ALTER TABLE dbo.cv_charges ADD dv_related BIT NULL;
+END`,
+		`IF COL_LENGTH(N'dbo.cv_charges', N'original_charge_text') IS NULL
+BEGIN
+    ALTER TABLE dbo.cv_charges ADD original_charge_text NVARCHAR(MAX) NULL;
+END`,
+		`IF COL_LENGTH(N'dbo.cv_charges', N'indicted_charge_text') IS NULL
+BEGIN
+    ALTER TABLE dbo.cv_charges ADD indicted_charge_text NVARCHAR(MAX) NULL;
+END`,
+		`IF COL_LENGTH(N'dbo.cv_charges', N'amended_charge_text') IS NULL
+BEGIN
+    ALTER TABLE dbo.cv_charges ADD amended_charge_text NVARCHAR(MAX) NULL;
+END`,
+		`IF COL_LENGTH(N'dbo.cv_charges', N'modifiers') IS NULL
+BEGIN
+    ALTER TABLE dbo.cv_charges ADD modifiers NVARCHAR(512) NULL;
+END`,
+		`IF COL_LENGTH(N'dbo.cv_charges', N'source_tab') IS NULL
+BEGIN
+    ALTER TABLE dbo.cv_charges ADD source_tab NVARCHAR(64) NULL;
+END`,
+		`IF COL_LENGTH(N'dbo.cv_charges', N'source_row_index') IS NULL
+BEGIN
+    ALTER TABLE dbo.cv_charges ADD source_row_index INT NULL;
+END`,
+		`IF OBJECT_ID(N'dbo.cv_charge_dispositions', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.cv_charge_dispositions (
+        charge_disposition_id BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+        charge_id BIGINT NOT NULL,
+        disposition_status NVARCHAR(256) NULL,
+        disposition_date DATE NULL,
+        plea NVARCHAR(128) NULL,
+        sentence_summary NVARCHAR(1024) NULL,
+        fine_amount DECIMAL(12,2) NULL,
+        jail_days INT NULL,
+        probation_days INT NULL,
+        is_final BIT NOT NULL DEFAULT 0,
+        raw_row_json NVARCHAR(MAX) NULL,
+        first_seen_at DATETIME2 NOT NULL,
+        last_seen_at DATETIME2 NOT NULL,
+        CONSTRAINT FK_cv_charge_dispositions_charge
+            FOREIGN KEY (charge_id)
+            REFERENCES dbo.cv_charges(charge_id)
+            ON DELETE CASCADE
+    );
+END`,
 		`IF OBJECT_ID(N'dbo.cv_case_events', N'U') IS NULL
 BEGIN
     CREATE TABLE dbo.cv_case_events (
@@ -1980,6 +2698,26 @@ END`,
 BEGIN
     CREATE INDEX idx_cv_case_parties_case_role
     ON dbo.cv_case_parties (case_id, party_role, last_seen_at DESC);
+END`,
+		`IF NOT EXISTS (
+    SELECT 1
+    FROM sys.indexes
+    WHERE name = N'idx_cv_charges_case_sequence'
+      AND object_id = OBJECT_ID(N'dbo.cv_charges')
+)
+BEGIN
+    CREATE INDEX idx_cv_charges_case_sequence
+    ON dbo.cv_charges (case_id, charge_sequence, last_seen_at DESC);
+END`,
+		`IF NOT EXISTS (
+    SELECT 1
+    FROM sys.indexes
+    WHERE name = N'idx_cv_charge_dispositions_charge'
+      AND object_id = OBJECT_ID(N'dbo.cv_charge_dispositions')
+)
+BEGIN
+    CREATE INDEX idx_cv_charge_dispositions_charge
+    ON dbo.cv_charge_dispositions (charge_id, disposition_date, last_seen_at DESC);
 END`,
 		`IF NOT EXISTS (
     SELECT 1
