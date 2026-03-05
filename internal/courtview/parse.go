@@ -130,13 +130,26 @@ func parseAjaxComponent(xmlBody string, componentID string) (string, bool) {
 func findNameTabAnchor(doc *goquery.Document) *goquery.Selection {
 	var found *goquery.Selection
 	doc.Find("a").EachWithBreak(func(_ int, a *goquery.Selection) bool {
-		if cleanText(a.Text()) == "Name" {
+		text := strings.ToLower(cleanText(a.Text()))
+		if text == "name" || strings.Contains(text, " name") || strings.HasPrefix(text, "name ") {
 			found = a
 			return false
 		}
 		return true
 	})
 	return found
+}
+
+func parseAnyAjaxComponent(xmlBody string) []string {
+	re := regexp.MustCompile(`(?s)<component id="[^"]+"[^>]*><!\[CDATA\[(.*?)\]\]></component>`)
+	matches := re.FindAllStringSubmatch(xmlBody, -1)
+	out := make([]string, 0, len(matches))
+	for _, m := range matches {
+		if len(m) == 2 {
+			out = append(out, m[1])
+		}
+	}
+	return out
 }
 
 func pageSnapshot(doc *goquery.Document, pageURL string) PageSnapshot {

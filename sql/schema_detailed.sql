@@ -17,10 +17,11 @@ BEGIN
         case_type NVARCHAR(128) NULL,
         case_status NVARCHAR(64) NULL,
         file_date DATE NULL,
-        case_judge NVARCHAR(256) NULL,
+        case_judge NVARCHAR(1024) NULL,
         source_url NVARCHAR(2048) NULL,
         first_seen_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
         last_seen_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        last_observed_change_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
         is_active BIT NOT NULL DEFAULT 1,
         CONSTRAINT UQ_cv_cases_case_number UNIQUE (case_number),
         CONSTRAINT UQ_cv_cases_case_number_normalized UNIQUE (case_number_normalized)
@@ -60,7 +61,44 @@ BEGIN
         is_government_entity BIT NOT NULL DEFAULT 0,
         entity_type NVARCHAR(64) NULL, -- Person, Government, Business, Unknown
         first_seen_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
-        last_seen_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+        last_seen_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        last_observed_change_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+    );
+END
+GO
+
+IF OBJECT_ID(N'dbo.cv_person_aliases', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.cv_person_aliases (
+        person_alias_id BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+        person_id BIGINT NOT NULL,
+        source_case_id BIGINT NULL,
+        alias_name_raw NVARCHAR(256) NOT NULL,
+        alias_name_normalized NVARCHAR(256) NOT NULL,
+        first_seen_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        last_seen_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT FK_cv_person_aliases_person
+            FOREIGN KEY (person_id) REFERENCES dbo.cv_people(person_id) ON DELETE CASCADE,
+        CONSTRAINT FK_cv_person_aliases_case
+            FOREIGN KEY (source_case_id) REFERENCES dbo.cv_cases(case_id) ON DELETE SET NULL
+    );
+END
+GO
+
+IF OBJECT_ID(N'dbo.cv_person_dobs', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.cv_person_dobs (
+        person_dob_id BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+        person_id BIGINT NOT NULL,
+        source_case_id BIGINT NULL,
+        dob_raw NVARCHAR(32) NOT NULL,
+        dob_date DATE NULL,
+        first_seen_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        last_seen_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT FK_cv_person_dobs_person
+            FOREIGN KEY (person_id) REFERENCES dbo.cv_people(person_id) ON DELETE CASCADE,
+        CONSTRAINT FK_cv_person_dobs_case
+            FOREIGN KEY (source_case_id) REFERENCES dbo.cv_cases(case_id) ON DELETE SET NULL
     );
 END
 GO
@@ -266,6 +304,16 @@ GO
 
 IF NOT EXISTS (
     SELECT 1 FROM sys.indexes
+    WHERE name = N'idx_cv_cases_last_observed_change_at'
+      AND object_id = OBJECT_ID(N'dbo.cv_cases')
+)
+BEGIN
+    CREATE INDEX idx_cv_cases_last_observed_change_at ON dbo.cv_cases (last_observed_change_at DESC);
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
     WHERE name = N'idx_cv_case_snapshots_case_latest'
       AND object_id = OBJECT_ID(N'dbo.cv_case_snapshots')
 )
@@ -282,6 +330,60 @@ IF NOT EXISTS (
 )
 BEGIN
     CREATE INDEX idx_cv_people_normalized_name ON dbo.cv_people (normalized_name, dob);
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = N'idx_cv_people_last_observed_change_at'
+      AND object_id = OBJECT_ID(N'dbo.cv_people')
+)
+BEGIN
+    CREATE INDEX idx_cv_people_last_observed_change_at ON dbo.cv_people (last_observed_change_at DESC);
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = N'uq_cv_person_aliases_person_alias'
+      AND object_id = OBJECT_ID(N'dbo.cv_person_aliases')
+)
+BEGIN
+    CREATE UNIQUE INDEX uq_cv_person_aliases_person_alias
+    ON dbo.cv_person_aliases (person_id, alias_name_normalized);
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = N'idx_cv_person_aliases_alias_name'
+      AND object_id = OBJECT_ID(N'dbo.cv_person_aliases')
+)
+BEGIN
+    CREATE INDEX idx_cv_person_aliases_alias_name
+    ON dbo.cv_person_aliases (alias_name_normalized, last_seen_at DESC);
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = N'uq_cv_person_dobs_person_dob_raw'
+      AND object_id = OBJECT_ID(N'dbo.cv_person_dobs')
+)
+BEGIN
+    CREATE UNIQUE INDEX uq_cv_person_dobs_person_dob_raw
+    ON dbo.cv_person_dobs (person_id, dob_raw);
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = N'idx_cv_person_dobs_dob_date'
+      AND object_id = OBJECT_ID(N'dbo.cv_person_dobs')
+)
+BEGIN
+    CREATE INDEX idx_cv_person_dobs_dob_date
+    ON dbo.cv_person_dobs (dob_date, last_seen_at DESC);
 END
 GO
 

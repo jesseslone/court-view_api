@@ -5,11 +5,14 @@ Production-oriented API for Alaska CourtView with:
 - direct CourtView scraping (no runtime browser)
 - case-number normalization
 - pagination traversal
-- SQL Server (T-SQL) persistence and retention
+- default SQLite quick-start persistence
+- SQL Server (T-SQL) persistence and retention option
+- built-in proof-of-concept web UI (`/ui`)
 
 ## Endpoints
 
 - `GET /healthz`
+- `GET /ui` (redirects to `/ui/`)
 - `GET /v1/search/name`
   - required: `first`, `last`
   - optional:
@@ -73,21 +76,28 @@ Examples:
 - `3AN1100123` -> `3AN-11-00123CR`
 - `3KE-25-184cr` -> `3KE-25-00184CR`
 
-## SQL Server behavior
+## Storage behavior
+
+The API supports:
+
+- `DB_PROVIDER=sqlite` (default, lightweight quick start)
+- `DB_PROVIDER=sqlserver` (existing or dedicated MSSQL server)
 
 On startup (when DB is enabled), the service:
 
 1. ensures database exists
 2. applies schema
-3. sets DB file max size defaults (`100MB` total budget split across data/log files, default `90MB` data + `10MB` log)
+3. applies retention defaults (`DB_MAX_SIZE_MB=100`, `DB_PURGE_TARGET_MB=80`)
 
 On writes, the service:
 
 - compares case payload hash (`payload_hash`) to existing record
-- updates only when changed (or touches query timestamp if unchanged)
+- updates detailed case data only when payload hash changes (otherwise only touches query/snapshot timestamps)
+- tracks `last_observed_change_at` when a case/person profile materially changes
+- tracks `last_successful_payload_hash` and skips replacing good payloads with transient tab-fetch failure payloads
 - purges oldest case records as capacity is approached (oldest `last_query_at` first)
 
-## Local run (without DB)
+## Local run (quick start)
 
 ```bash
 go mod tidy
@@ -95,17 +105,33 @@ go test ./...
 go run ./cmd/courtview-api
 ```
 
+This defaults to SQLite at `./data/courtview.sqlite`.
+
+UI:
+
+- `http://localhost:8088/ui/`
+
 Outside-container benchmark example:
 
 ```bash
 # terminal 1: run API on host using local SQL Server container
-DB_ENABLED=true DB_HOST=localhost DB_PORT=14333 DB_USER=sa DB_PASSWORD='YourStrongPassword!123' \
+DB_PROVIDER=sqlserver DB_ENABLED=true DB_HOST=localhost DB_PORT=14333 DB_USER=sa DB_PASSWORD='YourStrongPassword!123' \
 go run ./cmd/courtview-api
 
 # terminal 2: compare sequential vs concurrent
 curl -s -X POST "http://localhost:8088/v1/admin/backfill/anchorage-criminal?count=50&concurrency=1" | jq '.metrics'
 curl -s -X POST "http://localhost:8088/v1/admin/backfill/anchorage-criminal?count=50&concurrency=6" | jq '.metrics'
 ```
+
+## Docker quick start (SQLite default)
+
+```bash
+docker compose -f docker-compose.quickstart.yml up --build -d
+```
+
+Service:
+
+- API + UI: `http://localhost:8088` (`/ui/` for the web interface)
 
 ## Docker Compose (API + SQL Server)
 
@@ -147,15 +173,26 @@ Core:
 - `SERVICE_ADDR` (default `:8088`)
 - `COURTVIEW_BASE_URL` (default `https://records.courts.alaska.gov/eaccess/home.page.2`)
 
-DB:
+Provider selection:
 
+- `DB_PROVIDER` (`sqlite` default, `sqlserver`, `none`)
 - `DB_ENABLED` (`true`/`false`)
+
+SQLite:
+
+- `SQLITE_PATH` (default `data/courtview.sqlite`)
+- `DB_MAX_SIZE_MB` (default `100`)
+- `DB_PURGE_TARGET_MB` (default `80`)
+
+SQL Server:
+
 - `DB_HOST` (default `sqlserver`)
 - `DB_PORT` (default `1433`)
 - `DB_USER` (default `sa`)
 - `DB_PASSWORD` (required when DB enabled)
 - `DB_NAME` (default `courtview`)
 - `DB_ENCRYPT` (default `disable`)
+- `DB_TRUST_SERVER_CERTIFICATE` (default `true`; set to `false` for strict TLS validation)
 - `DB_MAX_SIZE_MB` (default `100`, total SQL data+log file budget in MB)
 - `DB_LOG_MAX_SIZE_MB` (default `10`, log file budget in MB)
 - `DB_PURGE_TARGET_MB` (default `80`, data-file usage target after purge)
@@ -168,10 +205,18 @@ Container image defaults:
 
 Override at runtime with `docker run -e ...` or in compose env.
 
+## SQL Server hardening options
+
+- See [`docs/mssql-setup.md`](docs/mssql-setup.md) for:
+  - Option A (private-only network + TLS validation + least-privilege SQL login)
+  - Option B (Microsoft Entra/passwordless, when your SQL target supports it)
+  - Microsoft documentation links for each SQL Server-side setup step
+
 ## T-SQL schema reference
 
 - `sql/schema.sql`
 - `sql/schema_detailed.sql` (expanded analytics/reporting model for parties, charges, dispositions, events, dockets, and raw tab snapshots)
+  - core detailed tables (`cv_cases`, `cv_case_snapshots`, `cv_people`, `cv_person_aliases`, `cv_person_dobs`, `cv_case_parties`, `cv_case_events`, `cv_docket_entries`, `cv_tab_*`) are auto-migrated and populated by the API store layer
 
 ## Clean history
 

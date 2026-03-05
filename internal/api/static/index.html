@@ -1,0 +1,600 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CourtView API Explorer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #f6f4ef;
+      --surface: #fffdf8;
+      --ink: #1f2430;
+      --muted: #596074;
+      --line: #d8d2c6;
+      --accent: #005f73;
+      --accent-2: #e76f51;
+      --ok: #2a9d8f;
+      --warn: #cc5803;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Space Grotesk", "Segoe UI", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(90rem 50rem at 10% -10%, #d9efe6 0%, transparent 65%),
+        radial-gradient(80rem 60rem at 100% 0%, #fde3d6 0%, transparent 65%),
+        var(--bg);
+      min-height: 100vh;
+    }
+    .shell {
+      width: min(1200px, 94vw);
+      margin: 1.5rem auto 2rem;
+      display: grid;
+      gap: 1rem;
+    }
+    .head, .panel {
+      background: linear-gradient(180deg, #fffefb, var(--surface));
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      box-shadow: 0 8px 30px rgba(31, 36, 48, 0.05);
+    }
+    .head {
+      padding: 1rem 1.2rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.8rem;
+    }
+    .head h1 {
+      margin: 0;
+      font-size: clamp(1.1rem, 2.4vw, 1.5rem);
+      letter-spacing: 0.02em;
+    }
+    .mono {
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      color: var(--muted);
+      font-size: 0.85rem;
+    }
+    .controls {
+      padding: 1rem 1.2rem;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 0.8rem;
+    }
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 0.8rem;
+      background: #fff;
+    }
+    .card h2 {
+      margin: 0 0 0.7rem;
+      font-size: 0.98rem;
+    }
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.45rem;
+    }
+    input, button {
+      width: 100%;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      padding: 0.58rem 0.65rem;
+      font: inherit;
+      color: var(--ink);
+      background: #fff;
+    }
+    input:focus {
+      outline: 2px solid color-mix(in srgb, var(--accent), white 70%);
+      border-color: var(--accent);
+    }
+    .btn {
+      border: 0;
+      font-weight: 600;
+      cursor: pointer;
+      color: #fff;
+      background: linear-gradient(135deg, var(--accent), #0a9396);
+      transition: transform 120ms ease, filter 120ms ease;
+    }
+    .btn:hover { transform: translateY(-1px); filter: brightness(1.03); }
+    .btn.alt { background: linear-gradient(135deg, var(--accent-2), #f4a261); }
+    .btn:disabled { opacity: 0.5; cursor: default; transform: none; }
+    .actions {
+      display: flex;
+      gap: 0.45rem;
+      margin-top: 0.6rem;
+    }
+    .actions .btn { flex: 1; }
+    .status {
+      padding: 0.8rem 1.2rem;
+      border-top: 1px solid var(--line);
+      font-size: 0.93rem;
+    }
+    .status.ok { color: var(--ok); }
+    .status.warn { color: var(--warn); }
+    .summary {
+      padding: 0.85rem 1.2rem;
+      border-top: 1px solid var(--line);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.6rem;
+    }
+    .chip {
+      padding: 0.35rem 0.6rem;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: #fff;
+      font-size: 0.84rem;
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+    }
+    .tableWrap {
+      overflow: auto;
+      border-top: 1px solid var(--line);
+    }
+    table {
+      width: 100%;
+      min-width: 980px;
+      border-collapse: collapse;
+      font-size: 0.86rem;
+      background: #fff;
+    }
+    th, td {
+      border-bottom: 1px solid #ebe6dd;
+      text-align: left;
+      vertical-align: top;
+      padding: 0.45rem 0.55rem;
+    }
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: #f7f3ec;
+      font-weight: 600;
+    }
+    @media (max-width: 780px) {
+      .row { grid-template-columns: 1fr; }
+      .actions { flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="head">
+      <h1>CourtView Lookup Quick Explorer</h1>
+      <div class="mono">API base: <span id="apiBase"></span></div>
+    </section>
+
+    <section class="panel">
+      <div class="controls">
+        <form class="card" id="caseForm">
+          <h2>Search by Case Number</h2>
+          <input name="case_number" placeholder="3AN-26-00001CR" required />
+          <div class="actions">
+            <button class="btn" type="submit">Search Case</button>
+          </div>
+        </form>
+
+        <form class="card" id="nameForm">
+          <h2>Search by Person Name</h2>
+          <div class="row">
+            <input name="first" placeholder="First name" required />
+            <input name="last" placeholder="Last name" required />
+          </div>
+          <input name="dob" placeholder="DOB (optional, MM/DD/YYYY)" />
+          <div class="actions">
+            <button class="btn" type="submit">Search Name</button>
+            <button class="btn alt" id="csvBtn" type="button" disabled>Download CSV</button>
+          </div>
+        </form>
+      </div>
+      <div class="status" id="status">Ready.</div>
+      <div class="summary" id="summary"></div>
+      <div class="tableWrap">
+        <table id="resultsTable">
+          <thead></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const state = {
+      rows: [],
+      source: "",
+      startedAt: null
+    };
+
+    const apiBase = window.location.origin;
+    document.getElementById("apiBase").textContent = apiBase;
+
+    const statusEl = document.getElementById("status");
+    const summaryEl = document.getElementById("summary");
+    const tableHead = document.querySelector("#resultsTable thead");
+    const tableBody = document.querySelector("#resultsTable tbody");
+    const csvBtn = document.getElementById("csvBtn");
+
+    const columns = [
+      "case_number",
+      "case_link",
+      "highest_charge_level",
+      "offense_date",
+      "arrest_date",
+      "case_disposition",
+      "amended_charges",
+      "case_status",
+      "file_date",
+      "case_judge",
+      "party_name",
+      "party_role",
+      "party_dob"
+    ];
+
+    const csvColumns = [
+      "case_number",
+      "case_url",
+      "highest_charge_level",
+      "offense_date",
+      "arrest_date",
+      "case_disposition",
+      "amended_charges",
+      "case_status",
+      "file_date",
+      "case_judge",
+      "party_name",
+      "party_role",
+      "party_dob"
+    ];
+
+    const columnLabels = {
+      case_number: "Case Number",
+      case_link: "Case Link",
+      case_url: "Case URL",
+      highest_charge_level: "Highest Charge",
+      offense_date: "Offense Date",
+      arrest_date: "Arrest Date",
+      case_disposition: "Disposition",
+      amended_charges: "Amended",
+      case_status: "Status",
+      file_date: "File Date",
+      case_judge: "Judge",
+      party_name: "Party",
+      party_role: "Role",
+      party_dob: "DOB"
+    };
+
+    const chargeLevelOrder = [
+      { label: "Unclassified Felony", re: /\bunclassified felony\b/i },
+      { label: "Class A Felony", re: /\bclass\s*a\s*felony\b/i },
+      { label: "Class B Felony", re: /\bclass\s*b\s*felony\b/i },
+      { label: "Class C Felony", re: /\bclass\s*c\s*felony\b/i },
+      { label: "Class D Felony", re: /\bclass\s*d\s*felony\b/i },
+      { label: "Class E Felony", re: /\bclass\s*e\s*felony\b/i },
+      { label: "Felony", re: /\bfelony\b/i },
+      { label: "Class A Misdemeanor", re: /\bclass\s*a\s*misdemeanor\b/i },
+      { label: "Class B Misdemeanor", re: /\bclass\s*b\s*misdemeanor\b/i },
+      { label: "Class C Misdemeanor", re: /\bclass\s*c\s*misdemeanor\b/i },
+      { label: "Misdemeanor", re: /\bmisdemeanor\b/i },
+      { label: "Violation", re: /\bviolation\b/i },
+      { label: "Infraction", re: /\binfraction\b/i }
+    ];
+
+    function setStatus(msg, level = "ok") {
+      statusEl.textContent = msg;
+      statusEl.className = `status ${level}`;
+    }
+
+    function normalizeSpace(value) {
+      return String(value || "").replace(/\s+/g, " ").trim();
+    }
+
+    function escapeRegex(value) {
+      return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    }
+
+    function capture(re, text) {
+      const m = String(text || "").match(re);
+      return m && m[1] ? normalizeSpace(m[1]) : "";
+    }
+
+    function extractDateAfterLabel(text, label) {
+      const re = new RegExp(`${escapeRegex(label)}\\s*:??\\s*([0-9]{1,2}\\/[0-9]{1,2}\\/[0-9]{4})`, "i");
+      return capture(re, text);
+    }
+
+    function extractDateFromDateTime(value) {
+      const m = String(value || "").match(/([0-9]{1,2}\/[0-9]{1,2}\/[0-9]{4})/);
+      return m ? m[1] : "";
+    }
+
+    function getRowsByHeaders(page, wanted) {
+      if (!page || !Array.isArray(page.tables)) return [];
+      const wantedLower = wanted.map(x => x.toLowerCase());
+      const out = [];
+      for (const table of page.tables) {
+        const headers = (table.headers || []).map(h => String(h).toLowerCase());
+        const hasAll = wantedLower.every(w => headers.includes(w));
+        if (!hasAll) continue;
+        for (const row of (table.rows || [])) {
+          const mapped = {};
+          for (let i = 0; i < headers.length; i += 1) {
+            mapped[headers[i]] = row[i] || "";
+          }
+          out.push(mapped);
+        }
+      }
+      return out;
+    }
+
+    function caseText(c) {
+      const parts = [];
+      const current = normalizeSpace(c?.current?.main_text_excerpt || "");
+      if (current) parts.push(current);
+      const tabs = c?.tabs || {};
+      for (const key of Object.keys(tabs)) {
+        const excerpt = normalizeSpace(tabs[key]?.main_text_excerpt || "");
+        if (!excerpt || excerpt.toLowerCase().startsWith("tab fetch failed:")) continue;
+        parts.push(excerpt);
+      }
+      return parts.join(" ");
+    }
+
+    function highestChargeLevel(text) {
+      for (const level of chargeLevelOrder) {
+        if (level.re.test(text)) return level.label;
+      }
+      return "";
+    }
+
+    function inferDisposition(text, docketRows, caseStatus) {
+      const explicit = capture(/(?:Current\s+)?Disposition[:\s]+(.+?)(?:\s+Case Judge:|\s+Next Event:|\s+Events|\s+Docket Information|$)/i, text);
+      if (explicit) return explicit;
+
+      const bucket = docketRows.map(r => normalizeSpace(r["docket text"] || "").toLowerCase()).join(" ");
+      if (/\bnot guilty\b/.test(bucket)) return "Not Guilty";
+      if (/\bdismiss(ed|al)\b/.test(bucket)) return "Dismissed";
+      if (/\bacquitt(ed|al)\b/.test(bucket)) return "Acquitted";
+      if (/\bconvict(ed|ion)\b/.test(bucket)) return "Convicted";
+      if (/\bguilty\b|\bchange of plea\b|\bplea\b/.test(bucket)) return "Guilty/Plea";
+      if (/\bsenten(c|t)e/.test(bucket)) return "Sentenced";
+      if (/closed/i.test(caseStatus)) return "Closed";
+      if (/open|active|pending/i.test(caseStatus)) return "Pending/Open";
+      return caseStatus || "";
+    }
+
+    function detectAmendedCharges(text, docketRows) {
+      const between = capture(/Amended Charge\s*(.*?)\s*DV Related\?/i, text);
+      if (between) {
+        if (/^(none|no|n\/a)$/i.test(between)) return "No";
+        return "Yes";
+      }
+      if (/amended charge/i.test(text)) return "Yes";
+      if (docketRows.some(r => /amend/i.test(String(r["docket text"] || "")))) return "Yes";
+      return "No";
+    }
+
+    function deriveCaseFacts(c) {
+      const labels = c?.current?.label_values || {};
+      const text = caseText(c);
+      const eventRows = getRowsByHeaders(c?.current, ["date/time", "type"]);
+      const docketRows = getRowsByHeaders(c?.current, ["date", "docket text"]);
+
+      const caseType = labels["Case Type"] || capture(/Case Type:\s*(.+?)\s+Case Status:/i, text);
+      const caseStatus = labels["Case Status"] || capture(/Case Status:\s*(.+?)\s+File Date:/i, text);
+      const fileDate = labels["File Date"] || extractDateAfterLabel(text, "File Date");
+      const caseJudge = labels["Case Judge"] || capture(/Case Judge:\s*(.+?)(?:\s+Next Event:|\s+All Information|\s+Party Information|\s+Charge Information|\s+Docket Information|$)/i, text);
+
+      const offenseDate =
+        extractDateAfterLabel(text, "Date of Offense") ||
+        extractDateAfterLabel(text, "Offense Date");
+
+      let arrestDate =
+        extractDateAfterLabel(text, "Arrest Date") ||
+        extractDateAfterLabel(text, "Date of Arrest") ||
+        extractDateAfterLabel(text, "Stage Date");
+
+      if (!arrestDate) {
+        const arraignment = eventRows.find(r => /arraignment/i.test(String(r["type"] || "")));
+        if (arraignment) arrestDate = extractDateFromDateTime(arraignment["date/time"]);
+      }
+      if (!arrestDate) {
+        const arrestDocket = docketRows.find(r => /(arrest|booking|arraignment)/i.test(String(r["docket text"] || "")));
+        if (arrestDocket) arrestDate = String(arrestDocket["date"] || "");
+      }
+
+      return {
+        case_type: caseType,
+        case_status: caseStatus,
+        file_date: fileDate,
+        case_judge: caseJudge,
+        highest_charge_level: highestChargeLevel(text),
+        offense_date: offenseDate,
+        arrest_date: arrestDate,
+        case_disposition: inferDisposition(text, docketRows, caseStatus),
+        amended_charges: detectAmendedCharges(text, docketRows)
+      };
+    }
+
+    function gatherCaseParties(resultsRows, caseNumber) {
+      const out = [];
+      for (const row of (resultsRows || [])) {
+        if ((row.case_number || "").toUpperCase() !== caseNumber.toUpperCase()) continue;
+        const values = row.values || {};
+        const role = values["Party Type"] || values["Role"] || "";
+        if (!/defendant/i.test(String(role))) continue;
+        out.push({
+          party_name: values["Party/Company"] || values["Party"] || "",
+          party_role: role,
+          party_dob: values["Date of Birth"] || values["DOB"] || ""
+        });
+      }
+      return out;
+    }
+
+    function flattenResponse(payload) {
+      const cases = payload.cases || [];
+      const rows = [];
+      for (const c of cases) {
+        const facts = deriveCaseFacts(c);
+        if (!/criminal/i.test(String(facts.case_type || ""))) continue;
+        const parties = gatherCaseParties(payload.results?.rows, c.case_number || "");
+        if (!parties.length) continue;
+        for (const p of parties) {
+          rows.push({
+            case_number: c.case_number || "",
+            case_link: "Open",
+            case_url: c.case_url || "",
+            highest_charge_level: facts.highest_charge_level,
+            offense_date: facts.offense_date,
+            arrest_date: facts.arrest_date,
+            case_disposition: facts.case_disposition,
+            amended_charges: facts.amended_charges,
+            case_status: facts.case_status,
+            file_date: facts.file_date,
+            case_judge: facts.case_judge,
+            party_name: p.party_name,
+            party_role: p.party_role,
+            party_dob: p.party_dob
+          });
+        }
+      }
+      return rows;
+    }
+
+    function renderTable(rows) {
+      tableHead.innerHTML = "";
+      tableBody.innerHTML = "";
+      if (!rows.length) return;
+
+      const tr = document.createElement("tr");
+      for (const c of columns) {
+        const th = document.createElement("th");
+        th.textContent = columnLabels[c] || c;
+        tr.appendChild(th);
+      }
+      tableHead.appendChild(tr);
+
+      const maxRows = 500;
+      for (const row of rows.slice(0, maxRows)) {
+        const r = document.createElement("tr");
+        for (const c of columns) {
+          const td = document.createElement("td");
+          if (c === "case_link") {
+            const a = document.createElement("a");
+            a.href = row.case_url || "#";
+            a.target = "_blank";
+            a.rel = "noreferrer noopener";
+            a.textContent = "Open";
+            if (!row.case_url) a.removeAttribute("href");
+            td.appendChild(a);
+          } else {
+            td.textContent = row[c] || "";
+          }
+          r.appendChild(td);
+        }
+        tableBody.appendChild(r);
+      }
+    }
+
+    function renderSummary(payload, rows) {
+      const chips = [];
+      chips.push(`rows=${rows.length}`);
+      chips.push(`cases=${(payload.cases || []).length}`);
+      if (payload.results?.rows) chips.push(`result_rows=${payload.results.rows.length}`);
+      if (payload.related_parties) chips.push(`related_parties=${payload.related_parties.length}`);
+      summaryEl.innerHTML = chips.map(c => `<span class="chip">${c}</span>`).join("");
+    }
+
+    function toCSV(rows) {
+      const esc = (v) => {
+        const s = String(v ?? "");
+        if (/[",\n]/.test(s)) return `"${s.replaceAll('"', '""')}"`;
+        return s;
+      };
+      const lines = [csvColumns.join(",")];
+      for (const row of rows) {
+        lines.push(csvColumns.map(k => esc(row[k] || "")).join(","));
+      }
+      return lines.join("\n");
+    }
+
+    function downloadCSV() {
+      if (!state.rows.length) return;
+      const csv = toCSV(state.rows);
+      const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      a.href = url;
+      a.download = `courtview-export-${stamp}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    async function fetchJSON(path) {
+      const r = await fetch(path);
+      const text = await r.text();
+      let data = {};
+      try { data = JSON.parse(text); } catch (_) {}
+      if (!r.ok) {
+        const msg = data.error || data.message || text || `HTTP ${r.status}`;
+        throw new Error(msg);
+      }
+      return data;
+    }
+
+    async function runQuery(path, sourceLabel) {
+      state.startedAt = performance.now();
+      setStatus("Loading...", "ok");
+      csvBtn.disabled = true;
+      try {
+        const payload = await fetchJSON(path);
+        const rows = flattenResponse(payload);
+        state.rows = rows;
+        state.source = sourceLabel;
+        renderSummary(payload, rows);
+        renderTable(rows);
+        csvBtn.disabled = rows.length === 0;
+        const ms = Math.round(performance.now() - state.startedAt);
+        setStatus(`Loaded ${rows.length} rows from ${sourceLabel} in ${ms}ms`, "ok");
+      } catch (err) {
+        state.rows = [];
+        renderSummary({}, []);
+        renderTable([]);
+        setStatus(`Error: ${err.message}`, "warn");
+      }
+    }
+
+    document.getElementById("caseForm").addEventListener("submit", (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.currentTarget);
+      const caseNumber = String(fd.get("case_number") || "").trim();
+      if (!caseNumber) return;
+      const path = `/v1/search/case?case_number=${encodeURIComponent(caseNumber)}&include_cases=true&include_defendant_network=true`;
+      runQuery(path, "case search");
+    });
+
+    document.getElementById("nameForm").addEventListener("submit", (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.currentTarget);
+      const first = String(fd.get("first") || "").trim();
+      const last = String(fd.get("last") || "").trim();
+      const dob = String(fd.get("dob") || "").trim();
+      if (!first || !last) return;
+      let path = `/v1/search/name?first=${encodeURIComponent(first)}&last=${encodeURIComponent(last)}&include_cases=true`;
+      if (dob) path += `&dob=${encodeURIComponent(dob)}`;
+      runQuery(path, "name search");
+    });
+
+    csvBtn.addEventListener("click", downloadCSV);
+  </script>
+</body>
+</html>

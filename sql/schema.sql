@@ -12,7 +12,12 @@ BEGIN
         payload_hash CHAR(64) NOT NULL,
         created_at DATETIME2 NOT NULL,
         updated_at DATETIME2 NOT NULL,
-        last_query_at DATETIME2 NOT NULL
+        last_query_at DATETIME2 NOT NULL,
+        last_observed_change_at DATETIME2 NOT NULL,
+        last_successful_payload_hash CHAR(64) NULL,
+        last_successful_at DATETIME2 NULL,
+        last_scrape_had_errors BIT NOT NULL DEFAULT 0,
+        last_scrape_error_at DATETIME2 NULL
     );
 END
 GO
@@ -56,5 +61,16 @@ IF NOT EXISTS (
 BEGIN
     CREATE INDEX idx_case_records_last_query_at
     ON dbo.case_records (last_query_at ASC);
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = N'idx_case_records_last_observed_change_at'
+      AND object_id = OBJECT_ID(N'dbo.case_records')
+)
+BEGIN
+    CREATE INDEX idx_case_records_last_observed_change_at
+    ON dbo.case_records (last_observed_change_at DESC);
 END
 GO

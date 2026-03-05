@@ -10,6 +10,8 @@ import (
 
 	"courtview_lookup/internal/api"
 	"courtview_lookup/internal/courtview"
+	storeiface "courtview_lookup/internal/store"
+	"courtview_lookup/internal/store/sqlite"
 	"courtview_lookup/internal/store/sqlserver"
 )
 
@@ -31,11 +33,33 @@ func main() {
 	initCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	store, err := sqlserver.NewFromEnv(initCtx)
-	if err != nil {
-		log.Fatalf("failed to initialize sqlserver store: %v", err)
+	provider := strings.ToLower(strings.TrimSpace(os.Getenv("DB_PROVIDER")))
+	if provider == "" {
+		provider = "sqlite"
 	}
-	defer store.Close()
+
+	var store storeiface.Store
+	switch provider {
+	case "sqlite":
+		sqliteStore, err := sqlite.NewFromEnv(initCtx)
+		if err != nil {
+			log.Fatalf("failed to initialize sqlite store: %v", err)
+		}
+		store = sqliteStore
+	case "sqlserver", "mssql":
+		sqlStore, err := sqlserver.NewFromEnv(initCtx)
+		if err != nil {
+			log.Fatalf("failed to initialize sqlserver store: %v", err)
+		}
+		store = sqlStore
+	case "none", "disabled":
+		store = nil
+	default:
+		log.Fatalf("unsupported DB_PROVIDER %q (supported: sqlite, sqlserver, none)", provider)
+	}
+	if store != nil {
+		defer store.Close()
+	}
 
 	server := api.NewServer(client, store)
 	log.Printf("courtview api listening on %s", addr)

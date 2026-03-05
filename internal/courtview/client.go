@@ -52,7 +52,7 @@ func NewClient(baseURL string) (*Client, error) {
 			Transport: transport,
 			Timeout:   60 * time.Second,
 		},
-		userAgent: "courtview-lookup-go/0.1",
+		userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
 	}, nil
 }
 
@@ -78,21 +78,31 @@ func (c *Client) SearchByName(
 		return NameSearchResponse{}, err
 	}
 
-	form := nameFormDoc.Find("form").Has("input[name='lastName']").First()
+	form := nameFormDoc.Find("form").FilterFunction(func(_ int, f *goquery.Selection) bool {
+		return hasInputByKey(f, "lastName")
+	}).First()
 	if form.Length() == 0 {
 		return NameSearchResponse{}, errors.New("could not locate name search form")
 	}
 
 	values := formDefaults(form)
-	values.Set("lastName", strings.TrimSpace(req.LastName))
-	values.Set("firstName", strings.TrimSpace(req.FirstName))
-	if req.DOBFrom != "" {
-		values.Set("dobDateRange:dateInputBegin", strings.TrimSpace(req.DOBFrom))
+	lastNameField := findInputFieldName(form, "lastName")
+	firstNameField := findInputFieldName(form, "firstName")
+	if lastNameField == "" || firstNameField == "" {
+		return NameSearchResponse{}, errors.New("name search form fields not found")
 	}
-	if req.DOBTo != "" {
-		values.Set("dobDateRange:dateInputEnd", strings.TrimSpace(req.DOBTo))
-	} else if req.DOBFrom != "" {
-		values.Set("dobDateRange:dateInputEnd", strings.TrimSpace(req.DOBFrom))
+	values.Set(lastNameField, strings.TrimSpace(req.LastName))
+	values.Set(firstNameField, strings.TrimSpace(req.FirstName))
+
+	dobBegin := findInputFieldName(form, "dobDateRange:dateInputBegin")
+	dobEnd := findInputFieldName(form, "dobDateRange:dateInputEnd")
+	if req.DOBFrom != "" && dobBegin != "" {
+		values.Set(dobBegin, strings.TrimSpace(req.DOBFrom))
+	}
+	if req.DOBTo != "" && dobEnd != "" {
+		values.Set(dobEnd, strings.TrimSpace(req.DOBTo))
+	} else if req.DOBFrom != "" && dobEnd != "" {
+		values.Set(dobEnd, strings.TrimSpace(req.DOBFrom))
 	}
 
 	submit := form.Find("input[type='submit'][name]").First()
@@ -175,13 +185,19 @@ func (c *Client) SearchByCaseNumber(
 		return CaseSearchResponse{}, err
 	}
 
-	form := caseFormDoc.Find("form").Has("input[name='caseDscr']").First()
+	form := caseFormDoc.Find("form").FilterFunction(func(_ int, f *goquery.Selection) bool {
+		return hasInputByKey(f, "caseDscr")
+	}).First()
 	if form.Length() == 0 {
 		return CaseSearchResponse{}, errors.New("could not locate case-number search form")
 	}
 
 	values := formDefaults(form)
-	values.Set("caseDscr", normalized)
+	caseField := findInputFieldName(form, "caseDscr")
+	if caseField == "" {
+		return CaseSearchResponse{}, errors.New("case-number input field not found")
+	}
+	values.Set(caseField, normalized)
 
 	submit := form.Find("input[type='submit'][name]").First()
 	if submit.Length() > 0 {
@@ -248,17 +264,44 @@ func (c *Client) enterSearchPage(ctx context.Context) (*goquery.Document, string
 		return nil, "", fmt.Errorf("parse home page: %w", err)
 	}
 
+	// Some deployments land directly on the search page.
+	if homeDoc.Find("input[name='lastName'], input[name='caseDscr']").Length() > 0 {
+		return homeDoc, homeURL, nil
+	}
+
+	if nextDoc, nextURL, handled, pbErr := c.tryResolvePostbackPage(ctx, homeDoc, homeURL); handled {
+		if pbErr == nil {
+			if nextDoc.Find("input[name='lastName'], input[name$='lastName'], input[name='caseDscr'], input[name$='caseDscr']").Length() > 0 {
+				return nextDoc, nextURL, nil
+			}
+			homeDoc = nextDoc
+			homeURL = nextURL
+		}
+	}
+
 	searchAnchor := homeDoc.Find("a").FilterFunction(func(_ int, s *goquery.Selection) bool {
-		return cleanText(s.Text()) == "Search Cases"
+		text := strings.ToLower(cleanText(s.Text()))
+		return text == "search cases" || strings.Contains(text, "search cases")
 	}).First()
 	if searchAnchor.Length() == 0 {
-		return nil, "", errors.New("could not locate Search Cases button")
+		// Resilient fallback when the home CTA text or markup changes.
+		return c.loadSearchPageFallback(ctx, homeURL)
 	}
 
 	onclick := firstAttr(searchAnchor, "onclick")
 	formID, action, submitField, ok := parseWicketSubmit(onclick)
 	if !ok {
-		return nil, "", errors.New("could not parse home Search Cases action")
+		// Some pages use href navigation instead of wicketSubmitFormById.
+		if href := strings.TrimSpace(firstAttr(searchAnchor, "href")); href != "" && href != "#" {
+			body, nextURL, _, hrefErr := c.get(ctx, absURL(homeURL, href), nil)
+			if hrefErr == nil {
+				nextDoc, parseErr := goquery.NewDocumentFromReader(bytes.NewReader(body))
+				if parseErr == nil {
+					return nextDoc, nextURL, nil
+				}
+			}
+		}
+		return c.loadSearchPageFallback(ctx, homeURL)
 	}
 
 	form := homeDoc.Find("form#" + formID)
@@ -300,20 +343,11 @@ func (c *Client) enterSearchPage(ctx context.Context) (*goquery.Document, string
 		return doc, finalURL, nil
 	}
 
-	fallbackURL := absURL(homeURL, "search.page")
-	fallbackBody, fallbackFinalURL, _, err := c.get(ctx, fallbackURL, nil)
-	if err != nil {
-		return nil, "", fmt.Errorf("fallback search.page load: %w", err)
-	}
-	fallbackDoc, err := goquery.NewDocumentFromReader(bytes.NewReader(fallbackBody))
-	if err != nil {
-		return nil, "", fmt.Errorf("parse fallback search page: %w", err)
-	}
-	return fallbackDoc, fallbackFinalURL, nil
+	return c.loadSearchPageFallback(ctx, homeURL)
 }
 
 func (c *Client) ensureNameTab(ctx context.Context, doc *goquery.Document, pageURL string) (*goquery.Document, string, error) {
-	if doc.Find("input[name='lastName']").Length() > 0 {
+	if hasInputByKey(doc.Selection, "lastName") {
 		return doc, pageURL, nil
 	}
 
@@ -327,7 +361,7 @@ func (c *Client) ensureNameTab(ctx context.Context, doc *goquery.Document, pageU
 		body, nextURL, _, err := c.get(ctx, absURL(pageURL, href), nil)
 		if err == nil {
 			nextDoc, parseErr := goquery.NewDocumentFromReader(bytes.NewReader(body))
-			if parseErr == nil && nextDoc.Find("input[name='lastName']").Length() > 0 {
+			if parseErr == nil && hasInputByKey(nextDoc.Selection, "lastName") {
 				return nextDoc, nextURL, nil
 			}
 		}
@@ -346,7 +380,17 @@ func (c *Client) ensureNameTab(ctx context.Context, doc *goquery.Document, pageU
 	xmlText := string(ajaxBody)
 	componentHTML, ok := parseAjaxComponent(xmlText, "id5a")
 	if !ok {
-		return nil, "", errors.New("could not parse name tab component from ajax response")
+		for _, candidate := range parseAnyAjaxComponent(xmlText) {
+			lc := strings.ToLower(candidate)
+			if strings.Contains(lc, "name=\"lastname\"") || strings.Contains(lc, "name='lastname'") {
+				componentHTML = candidate
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return nil, "", errors.New("could not parse name tab component from ajax response")
+		}
 	}
 
 	nameDoc, err := goquery.NewDocumentFromReader(strings.NewReader(componentHTML))
@@ -357,13 +401,14 @@ func (c *Client) ensureNameTab(ctx context.Context, doc *goquery.Document, pageU
 }
 
 func (c *Client) ensureCaseNumberTab(ctx context.Context, doc *goquery.Document, pageURL string) (*goquery.Document, string, error) {
-	if doc.Find("input[name='caseDscr']").Length() > 0 {
+	if hasInputByKey(doc.Selection, "caseDscr") {
 		return doc, pageURL, nil
 	}
 
 	var anchor *goquery.Selection
 	doc.Find("a").EachWithBreak(func(_ int, a *goquery.Selection) bool {
-		if cleanText(a.Text()) == "Case Number" {
+		text := strings.ToLower(cleanText(a.Text()))
+		if text == "case number" || strings.Contains(text, "case number") {
 			anchor = a
 			return false
 		}
@@ -378,7 +423,7 @@ func (c *Client) ensureCaseNumberTab(ctx context.Context, doc *goquery.Document,
 		body, nextURL, _, err := c.get(ctx, absURL(pageURL, href), nil)
 		if err == nil {
 			nextDoc, parseErr := goquery.NewDocumentFromReader(bytes.NewReader(body))
-			if parseErr == nil && nextDoc.Find("input[name='caseDscr']").Length() > 0 {
+			if parseErr == nil && hasInputByKey(nextDoc.Selection, "caseDscr") {
 				return nextDoc, nextURL, nil
 			}
 		}
@@ -397,7 +442,17 @@ func (c *Client) ensureCaseNumberTab(ctx context.Context, doc *goquery.Document,
 	xmlText := string(ajaxBody)
 	componentHTML, ok := parseAjaxComponent(xmlText, "id5a")
 	if !ok {
-		return nil, "", errors.New("could not parse case-number tab component from ajax response")
+		for _, candidate := range parseAnyAjaxComponent(xmlText) {
+			lc := strings.ToLower(candidate)
+			if strings.Contains(lc, "name=\"casedscr\"") || strings.Contains(lc, "name='casedscr'") {
+				componentHTML = candidate
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return nil, "", errors.New("could not parse case-number tab component from ajax response")
+		}
 	}
 
 	caseDoc, err := goquery.NewDocumentFromReader(strings.NewReader(componentHTML))
@@ -405,6 +460,94 @@ func (c *Client) ensureCaseNumberTab(ctx context.Context, doc *goquery.Document,
 		return nil, "", fmt.Errorf("parse case-number tab component html: %w", err)
 	}
 	return caseDoc, pageURL, nil
+}
+
+func (c *Client) loadSearchPageFallback(ctx context.Context, baseURL string) (*goquery.Document, string, error) {
+	fallbackURL := absURL(baseURL, "search.page")
+	fallbackBody, fallbackFinalURL, _, err := c.get(ctx, fallbackURL, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("fallback search.page load: %w", err)
+	}
+	fallbackDoc, err := goquery.NewDocumentFromReader(bytes.NewReader(fallbackBody))
+	if err != nil {
+		return nil, "", fmt.Errorf("parse fallback search page: %w", err)
+	}
+	if nextDoc, nextURL, handled, pbErr := c.tryResolvePostbackPage(ctx, fallbackDoc, fallbackFinalURL); handled {
+		if pbErr != nil {
+			return nil, "", fmt.Errorf("resolve fallback postback page: %w", pbErr)
+		}
+		return nextDoc, nextURL, nil
+	}
+	return fallbackDoc, fallbackFinalURL, nil
+}
+
+func (c *Client) tryResolvePostbackPage(ctx context.Context, doc *goquery.Document, pageURL string) (*goquery.Document, string, bool, error) {
+	form := doc.Find("form[name='postback']").First()
+	if form.Length() == 0 {
+		return nil, "", false, nil
+	}
+	action := strings.TrimSpace(firstAttr(form, "action"))
+	if action == "" {
+		return nil, "", true, errors.New("postback action is empty")
+	}
+
+	values := formDefaults(form)
+	setIfEmpty(values, "navigatorAppName", "Netscape")
+	setIfEmpty(values, "navigatorAppVersion", "5.0")
+	setIfEmpty(values, "navigatorAppCodeName", "Mozilla")
+	setIfEmpty(values, "navigatorCookieEnabled", "true")
+	setIfEmpty(values, "navigatorJavaEnabled", "false")
+	setIfEmpty(values, "navigatorLanguage", "en-US")
+	setIfEmpty(values, "navigatorPlatform", "MacIntel")
+	setIfEmpty(values, "navigatorUserAgent", c.userAgent)
+	setIfEmpty(values, "screenWidth", "1920")
+	setIfEmpty(values, "screenHeight", "1080")
+	setIfEmpty(values, "screenColorDepth", "24")
+	setIfEmpty(values, "utcOffset", "0")
+	setIfEmpty(values, "utcDSTOffset", "0")
+	setIfEmpty(values, "browserWidth", "1280")
+	setIfEmpty(values, "browserHeight", "900")
+	setIfEmpty(values, "hostname", "localhost")
+
+	body, nextURL, _, err := c.postForm(ctx, absURL(pageURL, action), values, nil)
+	if err != nil {
+		return nil, "", true, err
+	}
+	nextDoc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
+	if err != nil {
+		return nil, "", true, err
+	}
+	return nextDoc, nextURL, true, nil
+}
+
+func hasInputByKey(sel *goquery.Selection, key string) bool {
+	return findInputFieldName(sel, key) != ""
+}
+
+func findInputFieldName(sel *goquery.Selection, key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return ""
+	}
+	var fieldName string
+	sel.Find("input[name]").EachWithBreak(func(_ int, input *goquery.Selection) bool {
+		name := strings.TrimSpace(firstAttr(input, "name"))
+		if name == "" {
+			return true
+		}
+		if strings.EqualFold(name, key) || strings.HasSuffix(strings.ToLower(name), strings.ToLower(key)) {
+			fieldName = name
+			return false
+		}
+		return true
+	})
+	return fieldName
+}
+
+func setIfEmpty(values url.Values, key, value string) {
+	if strings.TrimSpace(values.Get(key)) == "" {
+		values.Set(key, value)
+	}
 }
 
 func (c *Client) FetchCase(ctx context.Context, caseURL string) CaseDetails {

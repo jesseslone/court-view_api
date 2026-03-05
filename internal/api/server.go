@@ -13,12 +13,12 @@ import (
 	"time"
 
 	"courtview_lookup/internal/courtview"
-	"courtview_lookup/internal/store/sqlserver"
+	storeiface "courtview_lookup/internal/store"
 )
 
 type Server struct {
 	client *courtview.Client
-	store  *sqlserver.Store
+	store  storeiface.Store
 }
 
 type backfillRequest struct {
@@ -96,7 +96,7 @@ type backfillAttemptResult struct {
 	changed           int
 }
 
-func NewServer(client *courtview.Client, store *sqlserver.Store) *Server {
+func NewServer(client *courtview.Client, store storeiface.Store) *Server {
 	return &Server{client: client, store: store}
 }
 
@@ -106,6 +106,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/search/name", s.handleNameSearch)
 	mux.HandleFunc("/v1/search/case", s.handleCaseSearch)
 	mux.HandleFunc("/v1/admin/backfill/anchorage-criminal", s.handleBackfillAnchorageCriminal)
+	mux.Handle("/ui/", http.StripPrefix("/ui/", uiHandler()))
+	mux.HandleFunc("/ui", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/ui/", http.StatusTemporaryRedirect)
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, "/ui/", http.StatusTemporaryRedirect)
+	})
 	return mux
 }
 

@@ -1,0 +1,29 @@
+services:
+  courtview-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: courtview-api:latest
+    container_name: courtview-api-quickstart
+    restart: unless-stopped
+    environment:
+      SERVICE_ADDR: ":8088"
+      COURTVIEW_BASE_URL: "https://records.courts.alaska.gov/eaccess/home.page.2"
+      DB_PROVIDER: "sqlite"
+      DB_ENABLED: "true"
+      SQLITE_PATH: "/app/data/courtview.sqlite"
+      DB_MAX_SIZE_MB: "100"
+      DB_PURGE_TARGET_MB: "80"
+    ports:
+      - "8088:8088"
+    volumes:
+      - sqlite_data:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8088/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  sqlite_data:
